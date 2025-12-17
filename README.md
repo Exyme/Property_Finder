@@ -2,6 +2,26 @@
 
 Automated property finder that fetches rental listings from Finn.no email alerts, geocodes addresses, calculates travel distances, and filters properties based on commute time.
 
+---
+
+## ⚠️ IMPORTANT: Security Notice
+
+**This repository does NOT contain any API keys, passwords, or credentials.**
+
+To run this project, you must:
+1. Create your **own** `.env` file with **your own** credentials
+2. Get your **own** [Google Maps API key](https://console.cloud.google.com/apis/credentials)
+3. Use your **own** Gmail account with an [App Password](https://support.google.com/accounts/answer/185833)
+
+The `.env` file is excluded from git via `.gitignore`. See `env.template` for the required format.
+
+**If you're setting up your own Google Maps API key, I strongly recommend:**
+- Setting up [billing alerts](https://cloud.google.com/billing/docs/how-to/budgets) in Google Cloud Console
+- Restricting your API key to specific APIs and IP addresses
+- Setting daily/monthly quotas on your APIs
+
+---
+
 ## Features
 
 - **Email Parsing**: Automatically fetches and parses property listing emails from Finn.no
@@ -37,7 +57,13 @@ pip install -r requirements.txt
 
 ### 2. Configure Environment Variables
 
-Create a `.env` file in the project root with the following variables:
+Copy the template and fill in your own credentials:
+
+```bash
+cp env.template .env
+```
+
+Then edit `.env` with your values:
 
 ```env
 # Email credentials (Gmail with App Password)
@@ -51,6 +77,7 @@ GOOGLE_API_KEY=your_google_maps_api_key
 **Important Notes:**
 - For Gmail, you need to use an [App Password](https://support.google.com/accounts/answer/185833), not your regular password
 - Enable the following Google Cloud APIs: Geocoding API, Distance Matrix API, Places API
+- **Set up billing alerts and API quotas** to avoid unexpected charges
 
 ### 3. Set Up Finn.no Email Alerts
 
@@ -104,8 +131,9 @@ Property_Finder/
 ├── extract_postcode.js     # Postcode extraction utility
 ├── run_property_finder.sh  # Shell script for automation
 ├── requirements.txt        # Python dependencies
-├── .env                    # Environment variables (not in repo)
-├── output/                 # Generated output files (not in repo)
+├── env.template            # Environment variables template
+├── .env                    # Your credentials (NOT in repo)
+├── output/                 # Generated output files (NOT in repo)
 │   ├── property_listings_*.csv
 │   ├── ambiguous_addresses_*.csv
 │   └── processed_email_uids.json
@@ -138,4 +166,3 @@ chmod +x run_property_finder.sh
 ## License
 
 MIT License
-
