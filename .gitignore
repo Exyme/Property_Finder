@@ -1,0 +1,61 @@
+# Environment variables (SENSITIVE - contains credentials)
+.env
+Email.env
+*.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+env/
+venv/
+ENV/
+.venv/
+
+# Output directories (generated data)
+output/
+test_output/
+
+# Data directories (CSV files from scraping)
+Initial_listings/
+enhanced_listings/
+
+# CSV files (may contain personal data)
+*.csv
+
+# Log files
+*.log
+
+# JSON data files (tracking files)
+processed_email_uids.json
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+.Spotlight-V100
+.Trashes
+
+# Workspace files
+*.code-workspace
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+

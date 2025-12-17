@@ -1,10 +1,12 @@
 # property_sourcer.py
 # Skeleton script for sourcing properties near specific gyms in Norway, filtered by price, size, and distance to Fornebu.
-
+import os
 import googlemaps  # For geocoding, places search, and distance matrix
+GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
+gmaps = googlemaps.Client(key=GOOGLE_API_KEY)
 import time        # For handling timestamps in API calls
 import imaplib     # For connecting to email inbox
-import email       # For parsing emails
+import email      # For parsing emails
 import pandas as pd  # For data handling and CSV output
 from email.header import decode_header  # For handling email subjects/headers
 
@@ -87,7 +89,7 @@ def main():
     4. Store results
     """
     setup_environment()
-    emails = fetch_emails()
+    emails = email_fetcher()
     properties = []
     for em in emails:
         prop = parse_property_from_email(em)
