@@ -218,13 +218,13 @@ def fetch_finn_emails(days_back=14, subject_keyword='Nye annonser: Property Find
     mailbox = MailBox(SERVER).login(EMAIL, PASSWORD, 'INBOX')
     
     # Build flexible criteria:
-    # - Emails from either sender (kaushalyawi@gmail.com OR agent@finn.no)
+    # - Emails from either sender (your email for forwarded emails OR agent@finn.no)
     # - AND subject contains the keyword (handles "Fwd:" prefix automatically)
     # - AND date is within the specified range
     # Search for emails matching Finn.no criteria (sender or subject)
     criteria = AND(
         OR(
-            A(from_='kaushalyawi@gmail.com'),
+            A(from_=EMAIL),  # For forwarded emails from yourself
             A(from_='agent@finn.no')
         ),
         A(date_gte=recent_date)

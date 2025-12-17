@@ -3,18 +3,20 @@
 # Property Finder Automation Script
 # This script runs the property finder with the correct Python environment
 
-# Set the working directory
-cd /Users/isuruwarakagoda/Projects/Property_Finder
+# Set the working directory to the script's directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
 # Set up logging
-LOG_FILE="/Users/isuruwarakagoda/Projects/Property_Finder/output/launchagent.log"
+LOG_FILE="$SCRIPT_DIR/output/launchagent.log"
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 
 # Log start time
 echo "[$TIMESTAMP] Starting Property Finder automation..." >> "$LOG_FILE"
 
 # Run the script and capture output
-/Library/Frameworks/Python.framework/Versions/3.14/bin/python3 property_finder.py >> "$LOG_FILE" 2>&1
+# Note: Adjust the Python path to match your environment
+python3 property_finder.py >> "$LOG_FILE" 2>&1
 
 # Log completion
 EXIT_CODE=$?
