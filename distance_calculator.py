@@ -11,6 +11,7 @@ from math import radians, cos, sin, asin, sqrt
 import logging
 from datetime import datetime
 from tracking_summary import tracker
+from config import CONFIG
 
 # ================================================
 # PRICE CLEANING UTILITY
@@ -313,23 +314,20 @@ DEFAULT_PLACE_SEARCH_TYPES = [
     'grocery_or_supermarket'
 ]
 
-DEFAULT_PLACE_CATEGORIES = {
-    'EVO': {
-        'keywords': ['EVO', 'Evo Fitness', 'EVO Fitness'],
-        'calculate_transit': False,
-        'column_prefix': 'EVO'
-    },
-    'SATS': {
-        'keywords': ['SATS', 'SATS Fitness'],
-        'calculate_transit': False,
-        'column_prefix': 'SATS'
-    },
-    'martial_arts': {
-        'keywords': ['martial arts gym', 'boxing gym', 'jiu jitsu', 'MMA', 'muay thai', 'bjj', 'Wrestling'],
-        'calculate_transit': True,
-        'column_prefix': 'martial_arts'
-    }
-}
+# Place categories from config.py - users can edit config.py to add/modify categories
+# The column_prefix defaults to the category name if not specified
+def get_place_categories():
+    """Get place categories from config.py with defaults for missing fields."""
+    categories = {}
+    for name, settings in CONFIG['place_categories'].items():
+        categories[name] = {
+            'keywords': settings.get('keywords', []),
+            'calculate_transit': settings.get('calculate_transit', False),
+            'column_prefix': settings.get('column_prefix', name)  # Default to category name
+        }
+    return categories
+
+DEFAULT_PLACE_CATEGORIES = get_place_categories()
 
 # In-memory cache for place searches (to avoid duplicate API calls)
 place_search_cache = {}

@@ -13,6 +13,7 @@ load_dotenv(dotenv_path='.env')  # Loads your Email.env file
 from bs4 import BeautifulSoup  # Add this import
 from urllib.parse import unquote  # For URL decoding
 from tracking_summary import tracker
+from config import CONFIG
 
 EMAIL = os.getenv('EMAIL')
 PASSWORD = os.getenv('PASSWORD')
@@ -526,14 +527,15 @@ def merge_with_master_listings(email_df, master_csv_path='master_listings.csv', 
         return email_df
 
 
-def fetch_finn_emails(days_back=14, subject_keyword='Nye annonser: Property Finder - Leie', 
+def fetch_finn_emails(days_back=None, subject_keywords=None, 
                        test_mode=False, output_dir='output', reprocess_emails=False):
     """
     Fetch Finn.no property emails from your inbox.
     
     Args:
-        days_back: How many days back to search (default: 14)
-        subject_keyword: Keyword to search for in subject line (default: "Nye annonser: Property Finder - Leie")
+        days_back: How many days back to search (default: from config.py)
+        subject_keywords: List of keywords to search for in subject line (default: from config.py)
+                         Emails matching ANY keyword will be fetched
         test_mode: If True, fetch all emails. If False, skip already processed emails.
         output_dir: Directory where the processed emails tracking file is stored
         reprocess_emails: If True, temporarily ignore processed UIDs and re-read all emails
@@ -541,10 +543,22 @@ def fetch_finn_emails(days_back=14, subject_keyword='Nye annonser: Property Find
     Returns:
         Tuple of (list of email messages, mailbox object) - mailbox should be used in a context manager
     """
+    # Use defaults from config.py if not provided
+    if days_back is None:
+        days_back = CONFIG['days_back']
+    if subject_keywords is None:
+        subject_keywords = CONFIG['subject_keywords']
+    
+    # Ensure subject_keywords is a list
+    if isinstance(subject_keywords, str):
+        subject_keywords = [subject_keywords]
+    
     recent_date = datetime.now().date() - timedelta(days=days_back)
 
     print(f"EMAIL: {EMAIL}")  # Should print your email if set
     print(f"PASSWORD is set: {PASSWORD is not None}")  # True if set, False if None
+    print(f"📅 Fetching emails from last {days_back} days")
+    print(f"🔍 Searching for {len(subject_keywords)} subject keyword(s)")
     if PASSWORD is None:
         raise ValueError("PASSWORD environment variable is not set!")
 
@@ -564,8 +578,12 @@ def fetch_finn_emails(days_back=14, subject_keyword='Nye annonser: Property Find
     )
     all_emails = list(mailbox.fetch(criteria, reverse=True)) 
     
-    # Filter emails to only those with the specified subject keyword
-    emails = [msg for msg in all_emails if subject_keyword in msg.subject]
+    # Filter emails to only those matching ANY of the subject keywords
+    def matches_any_keyword(subject, keywords):
+        return any(keyword in subject for keyword in keywords)
+    
+    emails = [msg for msg in all_emails if matches_any_keyword(msg.subject, subject_keywords)]
+    print(f"📧 Found {len(emails)} emails matching subject keywords")
     
     # Handle filtering by processed status
     if reprocess_emails:
@@ -828,7 +846,7 @@ def load_processed_finnkodes_from_distances_csv(output_dir='output', file_suffix
     return processed_finnkodes
 
 
-def fetch_and_parse_emails_workflow(args, days_back=14, subject_keyword='Nye annonser: Property Finder - Leie'):
+def fetch_and_parse_emails_workflow(args):
     """
     Fetch emails from Finn.no and parse property listings.
     
@@ -840,18 +858,19 @@ def fetch_and_parse_emails_workflow(args, days_back=14, subject_keyword='Nye ann
     5. Exports results to CSV files
     
     Args:
-        args: Argument object with output_dir, test_mode, file_suffix attributes
-        days_back: Number of days to look back for emails (default: 14)
-        subject_keyword: Keyword to search in email subject
+        args: Argument object with output_dir, test_mode, file_suffix, days_back, 
+              subject_keywords, reprocess_emails attributes
     
     Returns:
         tuple: (main_csv_path, ambiguous_csv_path) or (None, None) if no properties
     """
-    # Get output directory and test mode from args
+    # Get settings from args (which come from config.py or command-line overrides)
     output_dir = getattr(args, 'output_dir', 'output')
     test_mode = getattr(args, 'test_mode', False)
     file_suffix = getattr(args, 'file_suffix', '')
     reprocess_emails = getattr(args, 'reprocess_emails', False)
+    days_back = getattr(args, 'days_back', CONFIG['days_back'])
+    subject_keywords = getattr(args, 'subject_keywords', CONFIG['subject_keywords'])
     
     # Load existing property links to filter duplicates
     # In test mode, don't filter duplicates - we want to test the full workflow
@@ -866,7 +885,7 @@ def fetch_and_parse_emails_workflow(args, days_back=14, subject_keyword='Nye ann
     # Fetch emails (will filter out processed emails in non-test mode unless reprocess_emails is True)
     emails, mailbox = fetch_finn_emails(
         days_back=days_back, 
-        subject_keyword=subject_keyword,
+        subject_keywords=subject_keywords,
         test_mode=test_mode,
         output_dir=output_dir,
         reprocess_emails=reprocess_emails

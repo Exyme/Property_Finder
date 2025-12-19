@@ -7,12 +7,17 @@
 # 3. Calculate distances to work and filter by travel time
 # 4. Find nearby places (gyms, martial arts studios, etc.)
 # 5. Save results to CSV files
+#
+# USER CONFIGURATION: Edit config.py to customize settings
 
 import argparse
 import os
 import sys
 import shutil
 from datetime import datetime
+
+# Import user configuration
+from config import CONFIG
 
 # Import functions from existing modules
 from Email_Fetcher import fetch_and_parse_emails_workflow
@@ -97,10 +102,14 @@ def main():
     print("="*70)
     print("PROPERTY FINDER - AUTOMATED WORKFLOW")
     print("="*70)
-    print(f"\nConfiguration:")
+    print(f"\nConfiguration (edit config.py to change defaults):")
+    print(f"  Days back: {args.days_back}")
+    print(f"  Reprocess emails: {args.reprocess_emails}")
+    print(f"  Subject keywords: {len(args.subject_keywords)} configured")
+    for kw in args.subject_keywords:
+        print(f"    • {kw}")
     print(f"  Max travel time to work: {args.max_transit_time_work} minutes")
     print(f"  Test mode: {args.test_mode} (limit: {args.test_limit})")
-    print(f"  Reprocess emails: {args.reprocess_emails}")
     print(f"  Output directory: {args.output_dir}")
     print(f"  Search radius: {args.search_radius / 1000:.1f} km")
     print(f"  Work location: ({args.work_lat}, {args.work_lng})")
@@ -263,6 +272,8 @@ def parse_arguments():
     """
     Parse command-line arguments using argparse.
     
+    Default values come from config.py - command-line args override them.
+    
     First Principles:
     - argparse converts command-line strings into Python objects
     - Each argument can have a default value, type, and help text
@@ -274,7 +285,7 @@ def parse_arguments():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Full run with defaults
+  # Full run with defaults (from config.py)
   python3 property_finder.py
   
   # Skip email fetch, use existing CSV
@@ -286,9 +297,28 @@ Examples:
   # Custom max travel time and test mode
   python3 property_finder.py --max-transit-time-work 45 --test-mode --test-limit 10
   
-  # Custom facility and place searches
-  python3 property_finder.py --facility-keywords "EVO,SATS" --place-keywords "boxing,MMA"
+  # Fetch emails from last 3 months and reprocess all
+  python3 property_finder.py --days-back 90 --reprocess-emails
+
+Note: Edit config.py to change default settings permanently.
         """
+    )
+    
+    # ============================================
+    # EMAIL SETTINGS (defaults from config.py)
+    # ============================================
+    parser.add_argument(
+        '--days-back',
+        type=int,
+        default=CONFIG['days_back'],
+        help=f"How many days back to fetch emails (default: {CONFIG['days_back']} from config.py)"
+    )
+    
+    parser.add_argument(
+        '--reprocess-emails',
+        action='store_true',
+        default=CONFIG['reprocess_emails'],
+        help='Temporarily ignore processed email UIDs and re-read all emails from the time window'
     )
     
     # ============================================
@@ -297,8 +327,8 @@ Examples:
     parser.add_argument(
         '--max-transit-time-work',
         type=int,
-        default=60,
-        help='Maximum travel time to work location in minutes (default: 60)'
+        default=CONFIG['max_transit_time_work'],
+        help=f"Maximum travel time to work location in minutes (default: {CONFIG['max_transit_time_work']} from config.py)"
     )
     
     # ============================================
@@ -307,20 +337,15 @@ Examples:
     parser.add_argument(
         '--test-mode',
         action='store_true',
+        default=CONFIG['test_mode'],
         help='Enable test mode to limit the number of properties processed'
     )
     
     parser.add_argument(
         '--test-limit',
         type=int,
-        default=20,
-        help='Number of properties to process in test mode (default: 20, only used if --test-mode is set)'
-    )
-    
-    parser.add_argument(
-        '--reprocess-emails',
-        action='store_true',
-        help='Temporarily ignore processed email UIDs and re-read all emails from the time window (does not reset tracking file)'
+        default=CONFIG['test_limit'],
+        help=f"Number of properties to process in test mode (default: {CONFIG['test_limit']} from config.py)"
     )
     
     # ============================================
@@ -356,7 +381,7 @@ Examples:
         type=str,
         default=None,
         help='Comma-separated list of facility keywords to search for (e.g., "EVO,SATS,Evo Fitness"). '
-             'If not provided, uses default keywords from the script.'
+             'If not provided, uses config.py settings.'
     )
     
     # ============================================
@@ -367,7 +392,7 @@ Examples:
         type=str,
         default=None,
         help='Comma-separated list of place keywords to search for (e.g., "martial arts,boxing,MMA,muay thai"). '
-             'If not provided, uses default keywords from the script.'
+             'If not provided, uses config.py settings.'
     )
     
     parser.add_argument(
@@ -384,8 +409,8 @@ Examples:
     parser.add_argument(
         '--search-radius',
         type=int,
-        default=10000,
-        help='Search radius for nearby places in meters (default: 10000 = 10 km)'
+        default=CONFIG['search_radius'],
+        help=f"Search radius for nearby places in meters (default: {CONFIG['search_radius']} from config.py)"
     )
     
     # ============================================
@@ -394,15 +419,15 @@ Examples:
     parser.add_argument(
         '--work-lat',
         type=float,
-        default=59.899,
-        help='Work location latitude (default: 59.899 for Fornebu)'
+        default=CONFIG['work_lat'],
+        help=f"Work location latitude (default: {CONFIG['work_lat']} from config.py)"
     )
     
     parser.add_argument(
         '--work-lng',
         type=float,
-        default=10.627,
-        help='Work location longitude (default: 10.627 for Fornebu)'
+        default=CONFIG['work_lng'],
+        help=f"Work location longitude (default: {CONFIG['work_lng']} from config.py)"
     )
     
     # Parse the arguments
@@ -417,6 +442,9 @@ Examples:
     
     if args.place_types:
         args.place_types = [t.strip() for t in args.place_types.split(',')]
+    
+    # Add subject_keywords from config (not a command-line arg for simplicity)
+    args.subject_keywords = CONFIG['subject_keywords']
     
     return args
 
