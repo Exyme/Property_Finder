@@ -10,16 +10,16 @@ from email.mime.base import MIMEBase
 from email import encoders
 from dotenv import load_dotenv
 from pathlib import Path
+from datetime import datetime
 
 
 def send_property_results_notification(
     csv_with_distances_path,
-    csv_filtered_path,
     recipient_email=None,
     test_mode=False
 ):
     """
-    Send email notification with CSV file attachments.
+    Send email notification with CSV file attachment.
     
     First Principles:
     - MIMEMultipart: Creates an email that can have multiple parts (text + attachments)
@@ -29,13 +29,16 @@ def send_property_results_notification(
     
     Args:
         csv_with_distances_path (str): Path to property_listings_with_distances.csv
-        csv_filtered_path (str): Path to property_listings_filtered_by_distance.csv
         recipient_email (str, optional): Email address to send to (defaults to sender)
         test_mode (bool): If True, skip sending email notification
     
     Returns:
         bool: True if email sent successfully, False otherwise
     """
+    print("\n" + "="*70)
+    print("EMAIL NOTIFICATION")
+    print("="*70)
+    
     # Skip email notification in test mode
     if test_mode:
         print("🧪 TEST MODE: Skipping email notification")
@@ -46,60 +49,98 @@ def send_property_results_notification(
     sender_email = os.getenv('EMAIL')
     sender_password = os.getenv('PASSWORD')
     
+    # ============================================
+    # VALIDATE CREDENTIALS
+    # ============================================
+    print("\n📋 Validating email configuration...")
+    
+    if not sender_email:
+        print("❌ Error: EMAIL not set in .env file")
+        print("   Please add EMAIL=your-email@gmail.com to your .env file")
+        return False
+    
+    if not sender_password:
+        print("❌ Error: PASSWORD not set in .env file")
+        print("   Please add PASSWORD=your-app-password to your .env file")
+        print("   Note: Use a Gmail App Password, not your regular password")
+        return False
+    
     # Clean password (remove any non-breaking spaces)
-    if sender_password:
-        sender_password = sender_password.replace('\xa0', ' ').strip()
+    sender_password = sender_password.replace('\xa0', ' ').strip()
+    
+    print(f"   Sender: {sender_email}")
+    print(f"   Password: {'*' * (len(sender_password) - 4)}{sender_password[-4:]}")
     
     # Default recipient is the sender
     if recipient_email is None:
         recipient_email = sender_email
     
-    # Validate that files exist
+    print(f"   Recipient: {recipient_email}")
+    
+    # ============================================
+    # VALIDATE FILE
+    # ============================================
+    print("\n📋 Validating attachment file...")
+    
+    if not csv_with_distances_path:
+        print("❌ Error: No file path provided")
+        return False
+    
     if not os.path.exists(csv_with_distances_path):
         print(f"❌ Error: File not found: {csv_with_distances_path}")
+        print(f"   Current working directory: {os.getcwd()}")
+        print(f"   Absolute path: {os.path.abspath(csv_with_distances_path)}")
         return False
     
-    if not os.path.exists(csv_filtered_path):
-        print(f"❌ Error: File not found: {csv_filtered_path}")
-        return False
+    file_size = os.path.getsize(csv_with_distances_path)
+    print(f"   File: {csv_with_distances_path}")
+    print(f"   Size: {file_size:,} bytes")
     
-    # Count properties in each file (for the email message)
+    # Count properties in the file (for the email message)
+    count_all = "N/A"
+    count_completed = "N/A"
     try:
         import pandas as pd
         df_all = pd.read_csv(csv_with_distances_path)
-        df_filtered = pd.read_csv(csv_filtered_path)
         count_all = len(df_all)
-        count_filtered = len(df_filtered)
+        
+        # Count completed properties if column exists
+        if 'processing_status' in df_all.columns:
+            count_completed = len(df_all[df_all['processing_status'] == 'completed'])
+        else:
+            count_completed = count_all  # Assume all are completed if no status column
+            
+        print(f"   Properties: {count_all} (completed: {count_completed})")
     except Exception as e:
-        print(f"⚠️  Warning: Could not read CSV files to count properties: {e}")
-        count_all = "N/A"
-        count_filtered = "N/A"
+        print(f"⚠️  Warning: Could not read CSV file to count properties: {e}")
     
-    # Create the email message
+    # ============================================
+    # CREATE EMAIL MESSAGE
+    # ============================================
+    print("\n📧 Creating email message...")
+    
     msg = MIMEMultipart()
     msg['From'] = sender_email
     msg['To'] = recipient_email
-    msg['Subject'] = "🏠 Property Finder: Results Ready!"
+    msg['Subject'] = f"🏠 Property Finder: {count_all} Properties Ready! ({datetime.now().strftime('%Y-%m-%d')})"
     
     # Create email body
     body = f"""
     <html>
       <body>
         <h2>Property Finder Results Ready!</h2>
-        <p>Your property search has completed successfully.</p>
+        <p>Your property search has completed successfully on {datetime.now().strftime('%Y-%m-%d %H:%M')}.</p>
         
         <h3>Summary:</h3>
         <ul>
-          <li><strong>All properties with distances:</strong> {count_all} properties</li>
-          <li><strong>Filtered properties (within travel time):</strong> {count_filtered} properties</li>
+          <li><strong>Completed properties with distances:</strong> {count_all} properties</li>
         </ul>
         
-        <p>The CSV files are attached to this email. Download and open them to view the results.</p>
+        <p>The CSV file is attached to this email. Download and open it to view the results.</p>
         
-        <p>Files attached:</p>
+        <p>File attached:</p>
         <ul>
-          <li>property_listings_with_distances.csv - All properties with distance calculations</li>
-          <li>property_listings_filtered_by_distance.csv - Properties within your max travel time</li>
+          <li>property_listings_with_distances.csv - Completed properties with distance calculations and nearby gyms</li>
         </ul>
         
         <p>Best regards,<br>Property Finder Automation</p>
@@ -110,37 +151,77 @@ def send_property_results_notification(
     # Attach the HTML body
     msg.attach(MIMEText(body, 'html'))
     
-    # Attach the first CSV file
-    attach_file(msg, csv_with_distances_path, "property_listings_with_distances.csv")
-    
-    # Attach the second CSV file
-    attach_file(msg, csv_filtered_path, "property_listings_filtered_by_distance.csv")
-    
-    # Send the email
+    # Attach the CSV file
     try:
-        print(f"\n📧 Sending email notification to {recipient_email}...")
-        
+        attach_file(msg, csv_with_distances_path, "property_listings_with_distances.csv")
+        print("   ✅ CSV file attached successfully")
+    except Exception as e:
+        print(f"❌ Error attaching file: {e}")
+        return False
+    
+    # ============================================
+    # SEND EMAIL
+    # ============================================
+    print("\n📤 Sending email...")
+    
+    try:
         # Connect to Gmail's SMTP server
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()  # Enable encryption
+        print("   Connecting to smtp.gmail.com:587...")
+        server = smtplib.SMTP('smtp.gmail.com', 587, timeout=30)
+        server.set_debuglevel(0)  # Set to 1 for verbose SMTP output
+        
+        print("   Starting TLS encryption...")
+        server.starttls()
+        
+        print("   Logging in...")
         server.login(sender_email, sender_password)
         
-        # Send the email
+        print("   Sending message...")
         text = msg.as_string()
         server.sendmail(sender_email, recipient_email, text)
+        
+        print("   Closing connection...")
         server.quit()
         
-        print(f"✅ Email sent successfully!")
+        print(f"\n✅ Email sent successfully to {recipient_email}!")
+        print("="*70)
         return True
         
-    except smtplib.SMTPAuthenticationError:
-        print("❌ Error: Authentication failed. Check your email and password in .env")
-        print("   Make sure you're using a Gmail App Password, not your regular password.")
+    except smtplib.SMTPAuthenticationError as e:
+        print(f"\n❌ Error: Authentication failed")
+        print(f"   Details: {e}")
+        print("   Possible causes:")
+        print("   - Wrong email or password in .env file")
+        print("   - Not using a Gmail App Password (required for Gmail)")
+        print("   - 2-factor authentication not enabled on Gmail account")
+        print("   To create an App Password:")
+        print("   1. Go to https://myaccount.google.com/apppasswords")
+        print("   2. Generate a new app password for 'Mail'")
+        print("   3. Update PASSWORD in your .env file")
+        print("="*70)
+        return False
+    except smtplib.SMTPConnectError as e:
+        print(f"\n❌ Error: Could not connect to SMTP server")
+        print(f"   Details: {e}")
+        print("   Check your internet connection and firewall settings")
+        print("="*70)
+        return False
+    except smtplib.SMTPServerDisconnected as e:
+        print(f"\n❌ Error: Server disconnected unexpectedly")
+        print(f"   Details: {e}")
+        print("="*70)
+        return False
+    except TimeoutError as e:
+        print(f"\n❌ Error: Connection timed out")
+        print(f"   Details: {e}")
+        print("   Check your internet connection")
+        print("="*70)
         return False
     except Exception as e:
-        print(f"❌ Error sending email: {e}")
+        print(f"\n❌ Error sending email: {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
+        print("="*70)
         return False
 
 

@@ -11,12 +11,60 @@
 import argparse
 import os
 import sys
+import shutil
+from datetime import datetime
 
 # Import functions from existing modules
 from Email_Fetcher import fetch_and_parse_emails_workflow
 from Stringtocordinates import geocode_properties
 from distance_calculator import calculate_distances_and_filter
 from email_notifier import send_property_results_notification
+from tracking_summary import tracker
+
+
+def archive_property_listings_latest(output_dir='output', file_suffix=''):
+    """
+    Archive property_listings_latest.csv to a dated file and clear it.
+    
+    Creates a file named property_listings_DDMMYY.csv (e.g., property_listings_131224.csv)
+    and then clears property_listings_latest.csv (keeping only the header).
+    
+    Args:
+        output_dir: Directory where CSV files are stored
+        file_suffix: Suffix to append to filename (e.g., '_test')
+    """
+    latest_csv = os.path.join(output_dir, f'property_listings_latest{file_suffix}.csv')
+    
+    if not os.path.exists(latest_csv):
+        print(f"⚠️  property_listings_latest{file_suffix}.csv not found - nothing to archive")
+        return
+    
+    try:
+        # Read the current file to get header and row count
+        import pandas as pd
+        df = pd.read_csv(latest_csv)
+        row_count = len(df)
+        
+        if row_count == 0:
+            print("📋 property_listings_latest.csv is empty - nothing to archive")
+            return
+        
+        # Generate archive filename with date (DDMMYY format)
+        date_str = datetime.now().strftime('%d%m%y')
+        archive_filename = f'property_listings_{date_str}{file_suffix}.csv'
+        archive_path = os.path.join(output_dir, archive_filename)
+        
+        # Copy to archive
+        shutil.copy2(latest_csv, archive_path)
+        print(f"📦 Archived {row_count} properties to: {archive_filename}")
+        
+        # Clear the original file (keep header only)
+        df_empty = pd.DataFrame(columns=df.columns)
+        df_empty.to_csv(latest_csv, index=False)
+        print(f"🧹 Cleared property_listings_latest{file_suffix}.csv (kept header)")
+        
+    except Exception as e:
+        print(f"❌ Error archiving property_listings_latest.csv: {e}")
 
 
 def main():
@@ -52,6 +100,7 @@ def main():
     print(f"\nConfiguration:")
     print(f"  Max travel time to work: {args.max_transit_time_work} minutes")
     print(f"  Test mode: {args.test_mode} (limit: {args.test_limit})")
+    print(f"  Reprocess emails: {args.reprocess_emails}")
     print(f"  Output directory: {args.output_dir}")
     print(f"  Search radius: {args.search_radius / 1000:.1f} km")
     print(f"  Work location: ({args.work_lat}, {args.work_lng})")
@@ -137,6 +186,12 @@ def main():
         print(f"\n✅ Step 3 complete: Final results saved to: {result_csv}")
 
         # ============================================
+        # ARCHIVE property_listings_latest.csv
+        # ============================================
+        if not args.test_mode:
+            archive_property_listings_latest(args.output_dir, args.file_suffix)
+
+        # ============================================
         # STEP 4: SEND EMAIL NOTIFICATION
         # ============================================
         print()
@@ -145,21 +200,31 @@ def main():
         print("="*70)
         print()
         
-        # Skip email notification in test mode
+        # ============================================
+        # COMPREHENSIVE TRACKING SUMMARY
+        # ============================================
+        tracker.print_summary()
+        tracker.save_to_file(output_dir=args.output_dir)
+        tracker.save_to_history(output_dir=args.output_dir)
+        
+        # ============================================
+        # EMAIL NOTIFICATION
+        # ============================================
+        # Determine the path to the final CSV file
+        csv_with_distances = os.path.join(args.output_dir, f'property_listings_with_distances{args.file_suffix}.csv')
+        
+        # Send email notification (only if not in test mode)
         if args.test_mode:
-            print("🧪 TEST MODE: Skipping email notification")
+            print("\n🧪 TEST MODE: Skipping email notification")
         else:
-            # Determine the paths to the two final CSV files
-            csv_with_distances = os.path.join(args.output_dir, f'property_listings_with_distances{args.file_suffix}.csv')
-            csv_filtered = os.path.join(args.output_dir, f'property_listings_filtered_by_distance{args.file_suffix}.csv')
-            
-            # Send email notification
-            send_property_results_notification(
+            print("\n📧 Sending email notification...")
+            email_sent = send_property_results_notification(
                 csv_with_distances_path=csv_with_distances,
-                csv_filtered_path=csv_filtered,
                 recipient_email=None,  # Will default to your email from .env
-                test_mode=args.test_mode
-            )        
+                test_mode=False  # Always send email in non-test mode
+            )
+            if not email_sent:
+                print("⚠️  Warning: Email notification failed. Check logs above for details.")
         
         # ============================================
         # FINAL SUMMARY
@@ -250,6 +315,12 @@ Examples:
         type=int,
         default=20,
         help='Number of properties to process in test mode (default: 20, only used if --test-mode is set)'
+    )
+    
+    parser.add_argument(
+        '--reprocess-emails',
+        action='store_true',
+        help='Temporarily ignore processed email UIDs and re-read all emails from the time window (does not reset tracking file)'
     )
     
     # ============================================

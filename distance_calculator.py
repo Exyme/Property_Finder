@@ -10,6 +10,30 @@ from math import radians, cos, sin, asin, sqrt
 
 import logging
 from datetime import datetime
+from tracking_summary import tracker
+
+# ================================================
+# PRICE CLEANING UTILITY
+# ================================================
+
+def clean_price(price_str):
+    """
+    Clean price string to integer. E.g., '13 000 kr' -> 13000
+    
+    Args:
+        price_str: Price value (can be string like '13 000 kr' or integer)
+    
+    Returns:
+        int: Cleaned price as integer, or None if invalid
+    """
+    if pd.isna(price_str) or str(price_str).lower() == 'unknown':
+        return None
+    # Remove 'kr', non-breaking spaces, and regular spaces
+    price_str = str(price_str).replace('kr', '').replace('\xa0', '').replace(' ', '').strip()
+    try:
+        return int(float(price_str))  # Use float first to handle decimal strings
+    except ValueError:
+        return None
 
 # ================================================
 # STEP 1: SET UP ENVIRONMENT
@@ -185,6 +209,20 @@ def make_api_call_with_retry(api_func, *args, api_type='distance_matrix', **kwar
         try:
             check_rate_limit(api_type)
             result = api_func(*args, **kwargs)
+            
+            # Track successful API call
+            if result is not None:
+                current_time = time.time()
+                if api_type in api_call_tracker:
+                    api_call_tracker[api_type].append(current_time)
+                api_call_tracker['total_calls'] += 1
+                
+                # Update tracker stats
+                if api_type == 'distance_matrix':
+                    tracker.stats['step5_distance_calculation']['api_calls_distance_matrix'] += 1
+                elif api_type == 'places':
+                    tracker.stats['step5_distance_calculation']['api_calls_places'] += 1
+            
             return result
             
         except Exception as e:
@@ -860,12 +898,51 @@ def calculate_distances_and_filter(args, input_csv_path=None):
     print()
     
     # ================================================
-    # LOAD EXISTING DISTANCE DATA AND CHECK COMPLETION
+    # LOAD EXISTING DISTANCE DATA AND MERGE
     # ================================================
     
+    distances_csv_path = os.path.join(output_dir, f'property_listings_with_distances{file_suffix}.csv')
+    existing_df = None
+    
+    if os.path.exists(distances_csv_path):
+        existing_df = pd.read_csv(distances_csv_path)
+        tracker.stats['step5_distance_calculation']['existing_in_distances_csv'] = len(existing_df)
+        print(f"📊 Found {len(existing_df)} existing properties in property_listings_with_distances.csv")
+        
+        # Merge: Combine existing properties with new properties from input
+        # Deduplicate by 'link', keeping newer data (from df_valid) when duplicates exist
+        print(f"🔄 Merging {len(df_valid)} new properties with {len(existing_df)} existing properties...")
+        
+        # Ensure both DataFrames have compatible columns
+        # Add missing columns to df_valid from existing_df
+        for col in existing_df.columns:
+            if col not in df_valid.columns:
+                df_valid[col] = None
+        
+        # Add missing columns to existing_df from df_valid
+        for col in df_valid.columns:
+            if col not in existing_df.columns:
+                existing_df[col] = None
+        
+        # Concatenate and deduplicate (keep last = newer data from df_valid)
+        df_valid = pd.concat([existing_df, df_valid], ignore_index=True)
+        df_valid = df_valid.drop_duplicates(subset=['link'], keep='last')
+        
+        # Re-filter to only successfully geocoded (in case existing_df has some without coords)
+        if 'geocode_status' in df_valid.columns:
+            df_valid = df_valid[df_valid['geocode_status'] == 'Success'].copy()
+        
+        print(f"✅ Merged total: {len(df_valid)} properties (after deduplication)")
+        print()
+    else:
+        tracker.stats['step5_distance_calculation']['existing_in_distances_csv'] = 0
+        print("📊 No existing property_listings_with_distances.csv found - starting fresh")
+        print()
+    
+    # Load existing distance data as dictionary for quick lookup
     existing_data = load_existing_distance_data(output_dir, file_suffix)
     if existing_data:
-        print(f"📊 Found {len(existing_data)} properties with existing distance data")
+        print(f"📊 Found {len(existing_data)} properties with existing distance data for lookup")
     
     # Apply existing data to the dataframe and check completion status
     completed_count = 0
@@ -895,6 +972,9 @@ def calculate_distances_and_filter(args, input_csv_path=None):
     print(f"✅ Already completed: {completed_count} properties (will skip)")
     print(f"📍 Need processing: {len(incomplete_indices)} properties")
     print()
+    
+    # Track new properties to process
+    tracker.stats['step5_distance_calculation']['new_properties_to_process'] = len(incomplete_indices)
     
     # Apply test limit if in test mode - only on incomplete properties
     if test_mode and len(incomplete_indices) > test_limit:
@@ -958,9 +1038,21 @@ def calculate_distances_and_filter(args, input_csv_path=None):
         df_valid['transit_time_work_minutes'] = None
     
     # Count properties that need distance calculation
-    needs_distance = [idx for idx in incomplete_indices 
-                      if pd.isna(df_valid.at[idx, 'distance_to_work_km']) or 
-                         pd.isna(df_valid.at[idx, 'transit_time_work_minutes'])]
+    # Only process properties that are incomplete AND missing distance data
+    # Explicitly exclude completed properties
+    needs_distance = []
+    skipped_existing = 0
+    for idx in incomplete_indices:
+        status = df_valid.at[idx, 'processing_status']
+        # Only process if incomplete AND missing distance data
+        if status != 'completed':
+            if pd.isna(df_valid.at[idx, 'distance_to_work_km']) or pd.isna(df_valid.at[idx, 'transit_time_work_minutes']):
+                needs_distance.append(idx)
+            else:
+                skipped_existing += 1
+    
+    # Track skipped properties in tracker
+    tracker.stats['step5_distance_calculation']['properties_skipped_existing'] = skipped_existing
     
     if not needs_distance:
         print("="*70)
@@ -1254,7 +1346,7 @@ def calculate_distances_and_filter(args, input_csv_path=None):
     print("SAVING FINAL RESULTS")
     print("="*70)
     
-    base_columns = ['title', 'address', 'price', 'size', 'link']
+    base_columns = ['title', 'address', 'price', 'size', 'link', 'date_read']
     work_columns = ['distance_to_work_km', 'transit_time_work_minutes']
     
     category_columns = []
@@ -1274,12 +1366,11 @@ def calculate_distances_and_filter(args, input_csv_path=None):
     if len(df_filtered) > 0:
         df_filtered = df_filtered[final_columns]
     
-    output_file_final = os.path.join(output_dir, f'property_listings_with_distances{file_suffix}.csv')
-    df_filtered.to_csv(output_file_final, index=False, encoding='utf-8')
-    print(f"💾 Saved all filtered properties with distances and places to: {output_file_final}")
-    print(f"   Total properties: {len(df_filtered)}")
+    # ================================================
+    # PREPARE df_valid WITH ALL COLUMNS AND DATA
+    # ================================================
     
-    # Save complete dataset
+    # Add place category columns if they don't exist
     for cat_name, cat_config in place_categories.items():
         prefix = cat_config['column_prefix']
         if f'nearest_{prefix}' not in df_valid.columns:
@@ -1288,33 +1379,71 @@ def calculate_distances_and_filter(args, input_csv_path=None):
             if cat_config.get('calculate_transit', False):
                 df_valid[f'transit_time_{prefix}_minutes'] = None
     
+    # Update df_valid with data from df_filtered (for place search results)
     for col in df_filtered.columns:
         if col in df_valid.columns:
             df_valid.loc[df_filtered.index, col] = df_filtered[col]
     
+    # Prepare df_valid columns in correct order
     final_columns_valid = [col for col in all_columns if col in df_valid.columns]
     remaining_columns_valid = [col for col in df_valid.columns if col not in final_columns_valid]
     final_columns_valid.extend(remaining_columns_valid)
     df_valid = df_valid[final_columns_valid]
     
+    # Track final statistics
+    completed = (df_valid['processing_status'] == 'completed').sum() if 'processing_status' in df_valid.columns else 0
+    incomplete = (df_valid['processing_status'] == 'incomplete').sum() if 'processing_status' in df_valid.columns else 0
+    tracker.stats['step5_distance_calculation']['properties_processed'] = len(df_valid)
+    tracker.stats['step5_distance_calculation']['properties_completed'] = completed
+    tracker.stats['step5_distance_calculation']['properties_incomplete'] = incomplete
+    tracker.stats['step5_distance_calculation']['final_count'] = completed  # Only completed properties count
+    
+    # ================================================
+    # CLEAN PRICE DATA BEFORE SAVING
+    # ================================================
+    # Ensure all prices are clean integers (remove 'kr' suffix, spaces, etc.)
+    if 'price' in df_valid.columns:
+        df_valid['price'] = df_valid['price'].apply(clean_price)
+        print(f"🧹 Cleaned price column (removed 'kr' suffix and non-numeric characters)")
+    
+    # ================================================
+    # SAVE property_listings_complete.csv (ALL properties)
+    # ================================================
+    # This file contains ALL properties (completed + incomplete) for reference
     output_file_complete = os.path.join(output_dir, f'property_listings_complete{file_suffix}.csv')
     df_valid.to_csv(output_file_complete, index=False, encoding='utf-8')
-    print(f"💾 Saved complete property listings to: {output_file_complete}")
-    print(f"   Total properties: {len(df_valid)}")
+    print(f"💾 Saved ALL property listings to: {output_file_complete}")
+    print(f"   Total properties: {len(df_valid)} (completed: {completed}, incomplete: {incomplete})")
+    
+    # ================================================
+    # SAVE property_listings_with_distances.csv (ONLY completed properties)
+    # ================================================
+    # This is the source of truth for duplicate checking - only contains fully processed properties
+    output_file_final = os.path.join(output_dir, f'property_listings_with_distances{file_suffix}.csv')
+    
+    # Filter to only completed properties
+    df_completed = df_valid[df_valid['processing_status'] == 'completed'].copy()
+    
+    # Save ONLY completed properties to property_listings_with_distances.csv
+    df_completed.to_csv(output_file_final, index=False, encoding='utf-8')
+    print(f"💾 Saved COMPLETED properties to: {output_file_final}")
+    print(f"   Completed properties: {len(df_completed)}")
     
     print()
     print("="*70)
     print("✅ DISTANCE AND PLACE CALCULATIONS COMPLETE!")
     print("="*70)
     print(f"Summary:")
-    print(f"  • Total properties processed: {len(df_valid)}")
+    print(f"  • Total properties in database: {len(df_valid)}")
+    print(f"  • Completed (all data): {completed}")
+    print(f"  • Incomplete (missing place data): {incomplete}")
     print(f"  • Properties within {max_travel_time} min travel time: {len(df_filtered)}")
     print(f"  • Categories searched: {', '.join(place_categories.keys())}")
     print(f"  • Search radius: {search_radius / 1000:.1f} km")
     print()
     print("Output files:")
-    print(f"  • {output_file_final}")
-    print(f"  • {output_file_complete}")
+    print(f"  • {output_file_final} (ONLY completed properties - used for duplicate checking)")
+    print(f"  • {output_file_complete} (ALL properties - completed + incomplete)")
     print("="*70)
     
     # Log final API statistics

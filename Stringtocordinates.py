@@ -3,6 +3,7 @@ import os
 import time
 import googlemaps
 from dotenv import load_dotenv
+from tracking_summary import tracker
 
 # Get script directory for relative paths
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -291,6 +292,10 @@ def geocode_properties(args, input_csv_path=None):
             # Add a small delay to be polite to the API
             time.sleep(0.1)
         
+        # Track geocoding results
+        tracker.stats['step4_geocoding']['geocoding_success'] = successful_count + len(already_geocoded)
+        tracker.stats['step4_geocoding']['geocoding_failed'] = failed_count
+        
         # Print summary
         print("\n" + "="*70)
         print("GEOCODING SUMMARY")
@@ -322,6 +327,10 @@ def geocode_properties(args, input_csv_path=None):
     os.makedirs(output_dir, exist_ok=True)
     df.to_csv(output_file, index=False, encoding='utf-8')
     print(f"\n💾 Saved results to: {output_file}")
+    
+    # Track final count after geocoding
+    valid_coords = df[df['geocode_status'] == 'Success']
+    tracker.stats['step4_geocoding']['after_count'] = len(valid_coords)
     
     return output_file
 
