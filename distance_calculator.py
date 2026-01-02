@@ -11,7 +11,8 @@ from math import radians, cos, sin, asin, sqrt
 import logging
 from datetime import datetime
 from tracking_summary import tracker
-from config import CONFIG
+from config import CONFIG, get_type_aware_filename, load_property_type_config, load_api_safety_config
+from Email_Fetcher import extract_finnkode
 
 # ================================================
 # PRICE CLEANING UTILITY
@@ -386,36 +387,151 @@ def check_property_completion_status(row, place_categories):
         return 'incomplete'
 
 
-def load_existing_distance_data(output_dir='output', file_suffix=''):
+def load_existing_distance_data(output_dir='output', file_suffix='', property_type='rental'):
     """
     Load existing distance data from the distances CSV file.
+    
+    Uses finnkode (unique property ID) as the key instead of link to ensure
+    properties are recognized even if link format changes between runs.
     
     Args:
         output_dir: Directory where CSV files are stored
         file_suffix: Suffix appended to filename (e.g., '_test')
+        property_type: 'rental' or 'sales' (default: 'rental' for backward compat)
     
     Returns:
-        dict: Dictionary mapping property links to their distance/place data
+        dict: Dictionary mapping finnkode (str) to their distance/place data (dict)
     """
-    # Check both test and production CSVs
-    distances_csv = os.path.join(output_dir, f'property_listings_with_distances{file_suffix}.csv')
-    prod_distances_csv = os.path.join('output', 'property_listings_with_distances.csv')
+    # Use type-aware filename in the correct output_dir
+    distances_filename = get_type_aware_filename('property_listings_with_distances', property_type, file_suffix)
+    distances_csv = os.path.join(output_dir, distances_filename)
+    
+    # Also check old filename format within the same output_dir for backward compatibility (rental only)
+    paths_to_check = [distances_csv]
+    if property_type == 'rental' and file_suffix == '':
+        # For rental properties, also check old filename format (without type prefix) in the same directory
+        old_distances_csv = os.path.join(output_dir, 'property_listings_with_distances.csv')
+        if old_distances_csv != distances_csv:
+            paths_to_check.append(old_distances_csv)
     
     existing_data = {}
     
-    for csv_path in [distances_csv, prod_distances_csv]:
+    # Check all possible file locations
+    for csv_path in paths_to_check:
         if os.path.exists(csv_path):
             try:
                 df = pd.read_csv(csv_path)
                 for _, row in df.iterrows():
                     link = row.get('link')
                     if link:
-                        # Store all relevant columns for this property
-                        existing_data[link] = row.to_dict()
+                        # Extract finnkode from link and use it as the key
+                        finnkode = extract_finnkode(link)
+                        if finnkode:
+                            # Store all relevant columns for this property, keyed by finnkode
+                            existing_data[finnkode] = row.to_dict()
             except Exception as e:
                 logger.warning(f"Could not load existing distance data from {csv_path}: {e}")
     
     return existing_data
+
+
+def work_location_matches(prev_lat, prev_lng, current_lat, current_lng, tolerance=0.001):
+    """
+    Check if previous work location matches current work location within tolerance.
+    
+    Args:
+        prev_lat: Previous work latitude
+        prev_lng: Previous work longitude
+        current_lat: Current work latitude
+        current_lng: Current work longitude
+        tolerance: Tolerance in degrees (default 0.001 ~100m)
+    
+    Returns:
+        bool: True if locations match within tolerance
+    """
+    if pd.isna(prev_lat) or pd.isna(prev_lng):
+        return False  # No previous location stored
+    return (abs(prev_lat - current_lat) < tolerance and 
+            abs(prev_lng - current_lng) < tolerance)
+
+
+def load_too_far_properties(output_dir='output', file_suffix='', property_type='rental', 
+                            current_work_lat=None, current_work_lng=None, current_max_travel_time=None):
+    """
+    Load properties that were previously determined to be too far away.
+    
+    These properties exceeded max_transit_time_work_minutes and should be skipped
+    for geocoding and distance matrix API calls if the work location hasn't changed.
+    
+    Args:
+        output_dir: Directory where CSV files are stored
+        file_suffix: Suffix appended to filename (e.g., '_test')
+        property_type: 'rental' or 'sales' (default: 'rental')
+        current_work_lat: Current work location latitude
+        current_work_lng: Current work location longitude
+        current_max_travel_time: Current maximum travel time in minutes
+    
+    Returns:
+        set: Set of finnkodes (str) for properties that were too far away
+    """
+    if current_work_lat is None or current_work_lng is None or current_max_travel_time is None:
+        return set()  # Can't determine too far properties without current config
+    
+    # Use type-aware filename (with backward compatibility)
+    distances_filename = get_type_aware_filename('property_listings_with_distances', property_type, file_suffix)
+    distances_csv = os.path.join(output_dir, distances_filename)
+    
+    # Try type-aware filename first, then old naming for backward compatibility
+    if not os.path.exists(distances_csv) and property_type == 'rental':
+        old_distances_csv = os.path.join(output_dir, f'property_listings_with_distances{file_suffix}.csv')
+        if os.path.exists(old_distances_csv):
+            distances_csv = old_distances_csv
+    
+    too_far_finnkodes = set()
+    
+    if not os.path.exists(distances_csv):
+        return too_far_finnkodes  # No existing data
+    
+    try:
+        df = pd.read_csv(distances_csv)
+        
+        # Check if work_lat/work_lng columns exist (backward compatibility)
+        has_work_location = 'work_lat' in df.columns and 'work_lng' in df.columns
+        
+        for _, row in df.iterrows():
+            link = row.get('link')
+            if not link:
+                continue
+            
+            finnkode = extract_finnkode(link)
+            if not finnkode:
+                continue
+            
+            # Check if property was too far away
+            transit_time = row.get('transit_time_work_minutes')
+            if pd.isna(transit_time):
+                continue  # No transit time data, can't determine if too far
+            
+            if transit_time <= current_max_travel_time:
+                continue  # Property was within limit, don't skip
+            
+            # Property exceeded limit - check if work location matches
+            if has_work_location:
+                prev_work_lat = row.get('work_lat')
+                prev_work_lng = row.get('work_lng')
+                
+                if work_location_matches(prev_work_lat, prev_work_lng, current_work_lat, current_work_lng):
+                    # Work location matches - this property was too far and should be skipped
+                    too_far_finnkodes.add(finnkode)
+            else:
+                # No work location stored - can't verify if location matches
+                # For backward compatibility, don't skip (process the property)
+                pass
+        
+    except Exception as e:
+        logger.warning(f"Could not load too far properties from {distances_csv}: {e}")
+    
+    return too_far_finnkodes
 
 
 # ================================================
@@ -807,7 +923,8 @@ def calculate_distances_and_filter(args, input_csv_path=None):
             - facility_keywords: Custom facility keywords (e.g., ['EVO', 'SATS'])
             - place_keywords: Custom place keywords (e.g., ['boxing', 'MMA'])
             - place_types: Custom place types (e.g., ['gym'])
-        input_csv_path: Path to input CSV with coordinates (defaults to property_listings_with_coordinates.csv)
+            - property_type: 'rental' or 'sales' (default: 'rental')
+        input_csv_path: Path to input CSV with coordinates (defaults to type-aware property_listings_with_coordinates.csv)
     
     Returns:
         str: Path to output CSV file with filtered results
@@ -827,14 +944,22 @@ def calculate_distances_and_filter(args, input_csv_path=None):
     place_keywords = getattr(args, 'place_keywords', None)
     place_types = getattr(args, 'place_types', None)
     file_suffix = getattr(args, 'file_suffix', '')
+    property_type = getattr(args, 'property_type', 'rental')  # Get property_type from args
     
     # Ensure output_dir is an absolute path
     if not os.path.isabs(output_dir):
         output_dir = os.path.join(script_dir, output_dir)
     
-    # Determine input CSV path
+    # Determine input CSV path (type-aware)
     if input_csv_path is None:
-        input_csv_path = os.path.join(output_dir, f'property_listings_with_coordinates{file_suffix}.csv')
+        # Use type-aware filename for coordinates file
+        coords_filename = get_type_aware_filename('property_listings_with_coordinates', property_type, file_suffix)
+        input_csv_path = os.path.join(output_dir, coords_filename)
+        # Fallback to old naming for backward compatibility (rental only)
+        if not os.path.exists(input_csv_path) and property_type == 'rental':
+            old_input_csv_path = os.path.join(output_dir, f'property_listings_with_coordinates{file_suffix}.csv')
+            if os.path.exists(old_input_csv_path):
+                input_csv_path = old_input_csv_path
     
     # Initialize Google Maps client
     if not GOOGLE_API_KEY:
@@ -896,19 +1021,148 @@ def calculate_distances_and_filter(args, input_csv_path=None):
     print()
     
     # ================================================
+    # LOAD PROPERTIES THAT WERE PREVIOUSLY TOO FAR AWAY
+    # ================================================
+    too_far_finnkodes = load_too_far_properties(
+        output_dir, file_suffix, property_type,
+        work_lat, work_lng, max_travel_time
+    )
+    if too_far_finnkodes:
+        print(f"⏭️  Found {len(too_far_finnkodes)} properties that were previously too far away (will skip distance matrix API calls)")
+        print()
+    
+    # ================================================
     # LOAD EXISTING DISTANCE DATA AND MERGE
     # ================================================
     
-    distances_csv_path = os.path.join(output_dir, f'property_listings_with_distances{file_suffix}.csv')
+    # Use type-aware filename (with backward compatibility)
+    distances_filename = get_type_aware_filename('property_listings_with_distances', property_type, file_suffix)
+    distances_csv_path = os.path.join(output_dir, distances_filename)
     existing_df = None
     
+    # Try type-aware filename first, then old naming for backward compatibility
+    if not os.path.exists(distances_csv_path) and property_type == 'rental':
+        old_distances_csv_path = os.path.join(output_dir, f'property_listings_with_distances{file_suffix}.csv')
+        if os.path.exists(old_distances_csv_path):
+            distances_csv_path = old_distances_csv_path
+    
     if os.path.exists(distances_csv_path):
-        existing_df = pd.read_csv(distances_csv_path)
-        tracker.stats['step5_distance_calculation']['existing_in_distances_csv'] = len(existing_df)
-        print(f"📊 Found {len(existing_df)} existing properties in property_listings_with_distances.csv")
-        
-        # Merge: Combine existing properties with new properties from input
-        # Deduplicate by 'link', keeping newer data (from df_valid) when duplicates exist
+        # Check if file is empty
+        file_size = os.path.getsize(distances_csv_path)
+        if file_size > 0:
+            try:
+                existing_df = pd.read_csv(distances_csv_path)
+                # Check if dataframe is empty (only has header)
+                if len(existing_df) == 0:
+                    existing_df = None  # Treat as no existing data
+                else:
+                    tracker.stats['step5_distance_calculation']['existing_in_distances_csv'] = len(existing_df)
+                    print(f"📊 Found {len(existing_df)} existing properties in {os.path.basename(distances_csv_path)}")
+                    
+                    # ================================================
+                    # BACKFILL WORK LOCATION AND MAX_TRANSIT_TIME FOR BACKWARD COMPATIBILITY
+                    # ================================================
+                    # Properties processed before the fix don't have work_lat/work_lng/max_transit_time columns
+                    # Assume they were processed with current values and backfill
+                    needs_backfill = False
+                    backfilled_work_location_count = 0
+                    backfilled_max_transit_time_count = 0
+                    
+                    # Check if work_lat/work_lng columns exist
+                    has_work_location_columns = 'work_lat' in existing_df.columns and 'work_lng' in existing_df.columns
+                    
+                    # Check if max_transit_time_work_minutes column exists
+                    has_max_transit_time_column = 'max_transit_time_work_minutes' in existing_df.columns
+                    
+                    # Check if we have properties with distance data
+                    has_distance_data = 'transit_time_work_minutes' in existing_df.columns
+                    
+                    if has_distance_data:
+                        if not has_work_location_columns:
+                            # Columns don't exist - add them
+                            existing_df['work_lat'] = None
+                            existing_df['work_lng'] = None
+                        
+                        # Backfill missing work_lat/work_lng for properties with distance data
+                        distance_mask = existing_df['transit_time_work_minutes'].notna()
+                        missing_work_location = (
+                            existing_df['work_lat'].isna() | 
+                            existing_df['work_lng'].isna()
+                        )
+                        backfill_work_location_mask = distance_mask & missing_work_location
+                        
+                        if backfill_work_location_mask.any():
+                            existing_df.loc[backfill_work_location_mask, 'work_lat'] = work_lat
+                            existing_df.loc[backfill_work_location_mask, 'work_lng'] = work_lng
+                            backfilled_work_location_count = backfill_work_location_mask.sum()
+                            needs_backfill = True
+                        
+                        # Backfill max_transit_time_work_minutes for properties with distance data
+                        if not has_max_transit_time_column:
+                            # Column doesn't exist - add it
+                            existing_df['max_transit_time_work_minutes'] = None
+                        
+                        missing_max_transit_time = existing_df['max_transit_time_work_minutes'].isna()
+                        backfill_max_transit_time_mask = distance_mask & missing_max_transit_time
+                        
+                        if backfill_max_transit_time_mask.any():
+                            existing_df.loc[backfill_max_transit_time_mask, 'max_transit_time_work_minutes'] = max_travel_time
+                            backfilled_max_transit_time_count = backfill_max_transit_time_mask.sum()
+                            needs_backfill = True
+                    
+                    # Save updated CSV immediately if backfill was performed
+                    if needs_backfill:
+                        existing_df.to_csv(distances_csv_path, index=False, encoding='utf-8')
+                        if backfilled_work_location_count > 0:
+                            print(f"✅ Backfilled work location for {backfilled_work_location_count} properties (assumed current work location)")
+                        if backfilled_max_transit_time_count > 0:
+                            print(f"✅ Backfilled max_transit_time_work_minutes for {backfilled_max_transit_time_count} properties (assumed current max transit time)")
+                        print()
+            except pd.errors.EmptyDataError:
+                # File exists but has no data (empty or only header)
+                existing_df = None
+            except Exception as e:
+                logger.warning(f"Could not load existing distance data from {distances_csv_path}: {e}")
+                existing_df = None
+        else:
+            existing_df = None  # Empty file, treat as no existing data
+            
+            # #region agent log
+            # Check if backup file exists and has these properties
+            import json
+            import glob
+            backup_files = glob.glob(os.path.join(output_dir, f'*backup*.csv'))
+            for backup_file in backup_files:
+                if 'sales' in backup_file.lower() and property_type == 'sales':
+                    try:
+                        backup_df = pd.read_csv(backup_file)
+                        target_finnkodes = ['437802416', '442148776', '435383650']
+                        for target_fk in target_finnkodes:
+                            if 'link' in backup_df.columns:
+                                matching = backup_df[backup_df['link'].str.contains(target_fk, na=False)]
+                                if len(matching) > 0:
+                                    with open('/Users/isuruwarakagoda/Projects/.cursor/debug.log', 'a') as f:
+                                        f.write(json.dumps({
+                                            'sessionId': 'debug-session',
+                                            'runId': 'run1',
+                                            'hypothesisId': 'E',
+                                            'location': 'distance_calculator.py:954',
+                                            'message': f'Property {target_fk} found in backup file but main file empty',
+                                            'data': {'finnkode': target_fk, 'backup_file': os.path.basename(backup_file), 'backup_count': len(backup_df)},
+                                            'timestamp': int(time.time() * 1000)
+                                        }) + '\n')
+                    except Exception as e:
+                        pass
+            # #endregion
+    else:
+        existing_df = None
+        tracker.stats['step5_distance_calculation']['existing_in_distances_csv'] = 0
+        print("📊 No existing property_listings_with_distances.csv found - starting fresh")
+        print()
+    
+    # Merge: Combine existing properties with new properties from input (if existing_df exists)
+    if existing_df is not None:
+        # Deduplicate by finnkode, keeping newer data (from df_valid) when duplicates exist
         print(f"🔄 Merging {len(df_valid)} new properties with {len(existing_df)} existing properties...")
         
         # Ensure both DataFrames have compatible columns
@@ -922,9 +1176,56 @@ def calculate_distances_and_filter(args, input_csv_path=None):
             if col not in existing_df.columns:
                 existing_df[col] = None
         
-        # Concatenate and deduplicate (keep last = newer data from df_valid)
-        df_valid = pd.concat([existing_df, df_valid], ignore_index=True)
-        df_valid = df_valid.drop_duplicates(subset=['link'], keep='last')
+        # Extract finnkode for deduplication (use finnkode instead of link for reliable matching)
+        df_valid['_finnkode'] = df_valid['link'].apply(extract_finnkode)
+        existing_df['_finnkode'] = existing_df['link'].apply(extract_finnkode)
+        
+        # Store original date_read from existing_df before merge (to preserve first processing date)
+        original_date_read = {}
+        if 'date_read' in existing_df.columns:
+            for _, row in existing_df.iterrows():
+                finnkode = row.get('_finnkode')
+                date_read = row.get('date_read')
+                if finnkode and not pd.isna(date_read):
+                    original_date_read[finnkode] = date_read
+        
+        # Create a map of finnkodes to new coordinate data
+        new_coords_map = {}
+        for _, row in df_valid.iterrows():
+            finnkode = row.get('_finnkode')
+            if finnkode and (pd.notna(row.get('latitude')) or pd.notna(row.get('longitude'))):
+                new_coords_map[finnkode] = {
+                    'latitude': row.get('latitude'),
+                    'longitude': row.get('longitude'),
+                    'geocode_status': row.get('geocode_status')
+                }
+        
+        # Concatenate and deduplicate by finnkode (keep first = existing data with distance calculations)
+        # We keep 'first' (existing_df) to preserve distance data
+        combined = pd.concat([existing_df, df_valid], ignore_index=True)
+        df_valid = combined.drop_duplicates(subset=['_finnkode'], keep='first')
+        
+        # Update coordinates from new data if they're missing in existing data
+        for idx, row in df_valid.iterrows():
+            finnkode = row.get('_finnkode')
+            if finnkode and finnkode in new_coords_map:
+                new_coords = new_coords_map[finnkode]
+                if pd.isna(row.get('latitude')) and pd.notna(new_coords['latitude']):
+                    df_valid.at[idx, 'latitude'] = new_coords['latitude']
+                if pd.isna(row.get('longitude')) and pd.notna(new_coords['longitude']):
+                    df_valid.at[idx, 'longitude'] = new_coords['longitude']
+                if pd.isna(row.get('geocode_status')) and pd.notna(new_coords.get('geocode_status')):
+                    df_valid.at[idx, 'geocode_status'] = new_coords['geocode_status']
+        
+        # Restore original date_read for properties that already existed (preserve first processing date)
+        if 'date_read' in df_valid.columns:
+            for idx, row in df_valid.iterrows():
+                finnkode = row.get('_finnkode')
+                if finnkode and finnkode in original_date_read:
+                    df_valid.at[idx, 'date_read'] = original_date_read[finnkode]
+        
+        # Remove temporary finnkode column
+        df_valid = df_valid.drop(columns=['_finnkode'], errors='ignore')
         
         # Re-filter to only successfully geocoded (in case existing_df has some without coords)
         if 'geocode_status' in df_valid.columns:
@@ -938,7 +1239,7 @@ def calculate_distances_and_filter(args, input_csv_path=None):
         print()
     
     # Load existing distance data as dictionary for quick lookup
-    existing_data = load_existing_distance_data(output_dir, file_suffix)
+    existing_data = load_existing_distance_data(output_dir, file_suffix, property_type)
     if existing_data:
         print(f"📊 Found {len(existing_data)} properties with existing distance data for lookup")
     
@@ -949,13 +1250,22 @@ def calculate_distances_and_filter(args, input_csv_path=None):
     for idx, row in df_valid.iterrows():
         link = row.get('link')
         
-        # Apply existing data if available
-        if link and link in existing_data:
-            existing_row = existing_data[link]
+        # Extract finnkode from link and use it to match existing data
+        finnkode = None
+        if link:
+            finnkode = extract_finnkode(link)
+        
+        # Apply existing data if available (match by finnkode instead of link)
+        if finnkode and finnkode in existing_data:
+            existing_row = existing_data[finnkode]
             for col, val in existing_row.items():
                 if col not in df_valid.columns:
                     df_valid.at[idx, col] = val
                 elif pd.isna(df_valid.at[idx, col]) and not pd.isna(val):
+                    df_valid.at[idx, col] = val
+                elif col == 'date_read' and not pd.isna(val):
+                    # Preserve original date_read from existing data when property already processed
+                    # This ensures date_read reflects when property was first processed, not re-processed
                     df_valid.at[idx, col] = val
         
         # Check completion status
@@ -964,11 +1274,15 @@ def calculate_distances_and_filter(args, input_csv_path=None):
         
         if status == 'completed':
             completed_count += 1
+            if finnkode:
+                logger.info(f"[{property_type.upper()}] [DISTANCE] Property {finnkode}: ✅ SKIPPED (already fully processed)")
         else:
             incomplete_indices.append(idx)
+            # Don't log here - we'll log after checking if distance data exists
     
-    print(f"✅ Already completed: {completed_count} properties (will skip)")
-    print(f"📍 Need processing: {len(incomplete_indices)} properties")
+    print(f"✅ Already fully completed: {completed_count} properties (will skip)")
+    print(f"📍 Incomplete properties: {len(incomplete_indices)} properties")
+    print(f"   (Checking which ones need distance data...)")
     print()
     
     # Track new properties to process
@@ -981,6 +1295,15 @@ def calculate_distances_and_filter(args, input_csv_path=None):
         logger.info(f"Limited to {len(incomplete_indices)} properties for testing")
         print(f"TEST MODE: Limited to {len(incomplete_indices)} incomplete properties for testing")
     
+    # Initialize API safety
+    api_safety = load_api_safety_config()
+    distance_matrix_calls = 0
+    places_calls = 0
+    max_distance_matrix_calls = api_safety['max_distance_matrix_calls_per_run']
+    max_places_calls = api_safety['max_places_calls_per_run']
+    warning_threshold_dm = int(max_distance_matrix_calls * api_safety['warning_threshold_percent'] / 100)
+    warning_threshold_places = int(max_places_calls * api_safety['warning_threshold_percent'] / 100)
+    
     # Record start time for total execution timing
     script_start_time = time.time()
     
@@ -991,6 +1314,7 @@ def calculate_distances_and_filter(args, input_csv_path=None):
     stats = get_api_stats()
     logger.info(f"Initial API stats - Total calls: {stats['total_calls']}")
     logger.info(f"Properties to process: {len(df_valid)}")
+    logger.info(f"API Safety Limits - Distance Matrix: {max_distance_matrix_calls}, Places: {max_places_calls}")
     
     # ================================================
     # TEST DISTANCE CALCULATION
@@ -1036,21 +1360,40 @@ def calculate_distances_and_filter(args, input_csv_path=None):
         df_valid['transit_time_work_minutes'] = None
     
     # Count properties that need distance calculation
-    # Only process properties that are incomplete AND missing distance data
-    # Explicitly exclude completed properties
+    # Check if distance data exists independently of completion status
     needs_distance = []
     skipped_existing = 0
+    skipped_too_far = 0
     for idx in incomplete_indices:
-        status = df_valid.at[idx, 'processing_status']
-        # Only process if incomplete AND missing distance data
-        if status != 'completed':
-            if pd.isna(df_valid.at[idx, 'distance_to_work_km']) or pd.isna(df_valid.at[idx, 'transit_time_work_minutes']):
-                needs_distance.append(idx)
-            else:
-                skipped_existing += 1
+        # Check if distance data is missing (independent of completion status)
+        link = df_valid.at[idx, 'link']
+        finnkode = extract_finnkode(link) if link else None
+        
+        # Check if property was previously too far away (skip distance matrix API call if so)
+        if finnkode and finnkode in too_far_finnkodes:
+            skipped_too_far += 1
+            if finnkode:
+                logger.info(f"[{property_type.upper()}] [DISTANCE] Property {finnkode}: ✅ SKIPPED (previously too far away, no API calls)")
+        elif pd.isna(df_valid.at[idx, 'distance_to_work_km']) or pd.isna(df_valid.at[idx, 'transit_time_work_minutes']):
+            # This property needs distance calculation - will make API calls
+            needs_distance.append(idx)
+            if finnkode:
+                logger.info(f"[{property_type.upper()}] [DISTANCE] Property {finnkode}: 🔄 WILL PROCESS (making API calls)")
+        else:
+            # Skip - already has distance data
+            skipped_existing += 1
+            if finnkode:
+                logger.info(f"[{property_type.upper()}] [DISTANCE] Property {finnkode}: ✅ SKIPPED (already has distance data, no API calls)")
     
     # Track skipped properties in tracker
     tracker.stats['step5_distance_calculation']['properties_skipped_existing'] = skipped_existing
+    tracker.stats['step5_distance_calculation']['properties_skipped_too_far'] = skipped_too_far
+    
+    if skipped_existing > 0:
+        print(f"✅ Skipped {skipped_existing} properties (already have distance data, no API calls)")
+    if skipped_too_far > 0:
+        print(f"✅ Skipped {skipped_too_far} properties (previously too far away, no API calls)")
+    print()
     
     if not needs_distance:
         print("="*70)
@@ -1062,7 +1405,7 @@ def calculate_distances_and_filter(args, input_csv_path=None):
         print("="*70)
         print("CALCULATING DISTANCES FOR PROPERTIES MISSING DISTANCE DATA")
         print("="*70)
-        print(f"Processing {len(needs_distance)} properties...")
+        print(f"🔄 Processing {len(needs_distance)} properties (will make API calls)...")
         print("(This may take a few minutes due to API rate limits)")
         print()
         
@@ -1072,10 +1415,26 @@ def calculate_distances_and_filter(args, input_csv_path=None):
         failed_count = 0
         
         for i, index in enumerate(needs_distance, 1):
+            # Check API safety limits before making distance matrix call
+            if distance_matrix_calls >= max_distance_matrix_calls:
+                if api_safety['hard_stop_on_limit']:
+                    logger.error(f"[{property_type.upper()}] [DISTANCE] API LIMIT REACHED: {distance_matrix_calls}/{max_distance_matrix_calls} distance matrix calls. STOPPING.")
+                    print(f"\n⚠️  API LIMIT REACHED: {distance_matrix_calls}/{max_distance_matrix_calls} distance matrix calls")
+                    print("   Stopping to prevent API credit exhaustion.")
+                    break
+                else:
+                    logger.warning(f"[{property_type.upper()}] [DISTANCE] API LIMIT REACHED but hard_stop_on_limit is False. Continuing...")
+            
+            # Check warning threshold
+            if distance_matrix_calls >= warning_threshold_dm and distance_matrix_calls < max_distance_matrix_calls:
+                logger.warning(f"[{property_type.upper()}] [DISTANCE] Approaching API limit: {distance_matrix_calls}/{max_distance_matrix_calls} calls ({int(distance_matrix_calls*100/max_distance_matrix_calls)}%)")
+            
             row = df_valid.loc[index]
             property_address = row['address']
             property_lat = row['latitude']
             property_lng = row['longitude']
+            link = row.get('link')
+            finnkode = extract_finnkode(link) if link else None
             
             # Calculate remaining time estimate
             if i > 1:
@@ -1087,6 +1446,8 @@ def calculate_distances_and_filter(args, input_csv_path=None):
                 remaining_str = ""
             
             print(f"[{i}/{distance_total}] Processing: {property_address}{remaining_str}")
+            if finnkode:
+                logger.info(f"[{property_type.upper()}] [DISTANCE] Property {finnkode}: Making distance matrix API call")
             
             if i % 10 == 0:
                 stats = get_api_stats()
@@ -1099,6 +1460,7 @@ def calculate_distances_and_filter(args, input_csv_path=None):
                 property_lat, property_lng, work_lat, work_lng,
                 mode='transit', gmaps_client=gmaps_client
             )
+            distance_matrix_calls += 1  # Track API call
             
             # Update the DataFrame in place
             df_valid.at[index, 'distance_to_work_km'] = result['distance_km']
@@ -1106,9 +1468,13 @@ def calculate_distances_and_filter(args, input_csv_path=None):
             
             if result['status'] == 'OK':
                 successful_count += 1
+                if finnkode:
+                    logger.info(f"[{property_type.upper()}] [DISTANCE] Property {finnkode}: SUCCESS - Distance: {result['distance_km']:.2f} km, Time: {result['duration_minutes']:.1f} min")
                 print(f"  ✅ Distance: {result['distance_km']:.2f} km, Time: {result['duration_minutes']:.1f} min")
             else:
                 failed_count += 1
+                if finnkode:
+                    logger.warning(f"[{property_type.upper()}] [DISTANCE] Property {finnkode}: FAILED - Status: {result['status']}")
                 print(f"  ❌ Status: {result['status']}")
         
         print()
@@ -1130,10 +1496,97 @@ def calculate_distances_and_filter(args, input_csv_path=None):
     print(f"Maximum allowed travel time: {max_travel_time} minutes (by public transport)")
     print()
     
+    # Ensure transit_time_work_minutes column exists
+    if 'transit_time_work_minutes' not in df_valid.columns:
+        df_valid['transit_time_work_minutes'] = None
+    
+    # Filter properties: only include those with valid transit_time within limit
+    # This ensures properties outside the range are NEVER included in places API calls
     df_filtered = df_valid[
         (df_valid['transit_time_work_minutes'].notna()) & 
         (df_valid['transit_time_work_minutes'] <= max_travel_time)
     ].copy()
+    
+    # Re-apply existing place data to df_filtered to ensure all existing place data is available
+    for idx in df_filtered.index:
+        link = df_filtered.at[idx, 'link']
+        finnkode = extract_finnkode(link) if link else None
+        if finnkode and finnkode in existing_data:
+            existing_row = existing_data[finnkode]
+            for col, val in existing_row.items():
+                if col not in df_filtered.columns:
+                    df_filtered[col] = None
+                    df_filtered.at[idx, col] = val
+                elif pd.isna(df_filtered.at[idx, col]) and not pd.isna(val):
+                    df_filtered.at[idx, col] = val
+    
+    # ================================================
+    # INCLUDE PROPERTIES THAT NOW QUALIFY DUE TO INCREASED MAX_TRANSIT_TIME
+    # ================================================
+    # If max_transit_time increased, properties that were previously filtered out
+    # but now pass the threshold should get places API calls
+    properties_added_due_to_increase = 0
+    df_filtered_indices = set(df_filtered.index)
+    
+    for idx, row in df_valid.iterrows():
+        if idx in df_filtered_indices:
+            continue  # Already in df_filtered
+        
+        # Check if property passes current max_transit_time filter
+        transit_time = row.get('transit_time_work_minutes')
+        if pd.isna(transit_time) or transit_time > max_travel_time:
+            continue  # Doesn't pass current filter
+        
+        # Check work location match
+        stored_work_lat = row.get('work_lat')
+        stored_work_lng = row.get('work_lng')
+        if not work_location_matches(stored_work_lat, stored_work_lng, work_lat, work_lng):
+            continue  # Work location changed, skip
+        
+        # Check if property should be included (either has no places data, or was processed with lower max_transit_time)
+        stored_max_transit_time = row.get('max_transit_time_work_minutes')
+        
+        # Determine if property needs places API calls
+        needs_places_api = False
+        if pd.isna(stored_max_transit_time):
+            # No stored max_transit_time - check if has places data
+            has_places_data = False
+            for cat_name, cat_config in place_categories.items():
+                prefix = cat_config['column_prefix']
+                walking_col = f'walking_time_{prefix}_minutes'
+                if pd.notna(row.get(walking_col)):
+                    has_places_data = True
+                    break
+            if not has_places_data:
+                needs_places_api = True
+        else:
+            # Has stored max_transit_time - check if it's less than current (was filtered out before)
+            if stored_max_transit_time < max_travel_time:
+                # Was processed with lower threshold, now qualifies - needs places API
+                needs_places_api = True
+        
+        if needs_places_api:
+            # Double-check: ensure property passes current max_transit_time filter
+            # This is a safety check to prevent properties outside range from being added
+            if pd.isna(transit_time) or transit_time > max_travel_time:
+                continue  # Safety check failed - skip this property
+            
+            # Add property to df_filtered
+            new_row = row.copy()
+            # Ensure all columns from df_filtered exist in new_row
+            for col in df_filtered.columns:
+                if col not in new_row.index:
+                    new_row[col] = None
+            # Ensure transit_time_work_minutes is set correctly
+            if 'transit_time_work_minutes' not in new_row.index or pd.isna(new_row.get('transit_time_work_minutes')):
+                new_row['transit_time_work_minutes'] = transit_time
+            # Add to df_filtered (append as new row)
+            df_filtered = pd.concat([df_filtered, new_row.to_frame().T], ignore_index=False)
+            properties_added_due_to_increase += 1
+    
+    if properties_added_due_to_increase > 0:
+        print(f"✅ Added {properties_added_due_to_increase} properties that now qualify due to increased max_transit_time (will get places API calls)")
+        print()
     
     print(f"Properties before filtering: {len(df_valid)}")
     print(f"Properties after filtering: {len(df_filtered)}")
@@ -1176,12 +1629,32 @@ def calculate_distances_and_filter(args, input_csv_path=None):
     
     os.makedirs(output_dir, exist_ok=True)
     
-    output_file_all = os.path.join(output_dir, f'property_listings_with_distances{file_suffix}.csv')
+    # Store work location in DataFrame before saving
+    # Ensure these columns exist for both rental and sales properties
+    if 'work_lat' not in df_valid.columns:
+        df_valid['work_lat'] = None
+    df_valid['work_lat'] = work_lat  # Update to current work location
+    if 'work_lng' not in df_valid.columns:
+        df_valid['work_lng'] = None
+    df_valid['work_lng'] = work_lng  # Update to current work location
+    
+    # Store max_transit_time_work_minutes in DataFrame before saving
+    # Ensure this column exists for both rental and sales properties (critical for deduplication)
+    if 'max_transit_time_work_minutes' not in df_valid.columns:
+        df_valid['max_transit_time_work_minutes'] = None
+    # Update max_transit_time_work_minutes for all properties (including those that exceed limit)
+    # This allows us to track what threshold was used when processing each property
+    df_valid['max_transit_time_work_minutes'] = max_travel_time
+    
+    # Use type-aware filenames
+    output_filename_all = get_type_aware_filename('property_listings_with_distances', property_type, file_suffix)
+    output_file_all = os.path.join(output_dir, output_filename_all)
     df_valid.to_csv(output_file_all, index=False, encoding='utf-8')
     print(f"💾 Saved all properties with distances to: {output_file_all}")
     
     if len(df_filtered) > 0:
-        output_file_filtered = os.path.join(output_dir, f'property_listings_filtered_by_distance{file_suffix}.csv')
+        output_filename_filtered = get_type_aware_filename('property_listings_filtered_by_distance', property_type, file_suffix)
+        output_file_filtered = os.path.join(output_dir, output_filename_filtered)
         df_filtered.to_csv(output_file_filtered, index=False, encoding='utf-8')
         print(f"💾 Saved filtered properties to: {output_file_filtered}")
     else:
@@ -1207,15 +1680,50 @@ def calculate_distances_and_filter(args, input_csv_path=None):
         
         # Find properties that need place data for any category
         needs_place_data = []
+        all_have_place_data = []
         for idx, row in df_filtered.iterrows():
+            needs_any = False
             for cat_name, cat_config in place_categories.items():
                 prefix = cat_config['column_prefix']
                 walking_col = f'walking_time_{prefix}_minutes'
                 
                 # If any category is missing walking time, we need to process this property
                 if pd.isna(row.get(walking_col)):
-                    needs_place_data.append(idx)
+                    needs_any = True
                     break
+            if needs_any:
+                needs_place_data.append(idx)
+            else:
+                all_have_place_data.append(idx)
+        
+        # Filter out properties that exceed max_transit_time (safety check - should already be filtered, but ensure no API calls for excluded properties)
+        # This is critical for sales properties to avoid unnecessary API calls
+        original_count = len(needs_place_data)
+        needs_place_data = [
+            idx for idx in needs_place_data 
+            if pd.notna(df_filtered.at[idx, 'transit_time_work_minutes']) 
+            and df_filtered.at[idx, 'transit_time_work_minutes'] <= max_travel_time
+        ]
+        excluded_count = original_count - len(needs_place_data)
+        
+        # Additional safety: Remove any properties from df_filtered that exceed max_travel_time
+        # This ensures df_filtered only contains properties within the limit
+        if excluded_count > 0:
+            # Find indices in df_filtered that exceed max_travel_time
+            exceed_mask = (
+                df_filtered['transit_time_work_minutes'].notna() & 
+                (df_filtered['transit_time_work_minutes'] > max_travel_time)
+            )
+            if exceed_mask.any():
+                exceeded_indices = df_filtered[exceed_mask].index.tolist()
+                df_filtered = df_filtered[~exceed_mask].copy()
+                print(f"⚠️  Removed {len(exceeded_indices)} properties from df_filtered that exceeded max_travel_time (safety check)")
+        
+        if len(all_have_place_data) > 0:
+            print(f"✅ Skipped {len(all_have_place_data)} properties (already have all place data, no API calls)")
+        if excluded_count > 0:
+            print(f"✅ Excluded {excluded_count} properties (exceed max_transit_time, no API calls)")
+        print()
         
         if not needs_place_data:
             print("="*70)
@@ -1227,7 +1735,7 @@ def calculate_distances_and_filter(args, input_csv_path=None):
             print("="*70)
             print("FINDING NEAREST PLACES BY CATEGORY FOR PROPERTIES MISSING DATA")
             print("="*70)
-            print(f"Processing {len(needs_place_data)} properties that need place data...")
+            print(f"🔄 Processing {len(needs_place_data)} properties (will make API calls)...")
             print(f"Search radius: {search_radius / 1000:.1f} km")
             print(f"Categories: {', '.join(place_categories.keys())}")
             print("(This may take several minutes due to API rate limits)")
@@ -1266,6 +1774,25 @@ def calculate_distances_and_filter(args, input_csv_path=None):
                         category_found_counts[cat_name] += 1
                         continue
                     
+                    # Check API safety limits before making places API call
+                    if places_calls >= max_places_calls:
+                        if api_safety['hard_stop_on_limit']:
+                            logger.error(f"[{property_type.upper()}] [PLACES] API LIMIT REACHED: {places_calls}/{max_places_calls} places calls. STOPPING.")
+                            print(f"\n⚠️  API LIMIT REACHED: {places_calls}/{max_places_calls} places calls")
+                            print("   Stopping to prevent API credit exhaustion.")
+                            break
+                        else:
+                            logger.warning(f"[{property_type.upper()}] [PLACES] API LIMIT REACHED but hard_stop_on_limit is False. Continuing...")
+                    
+                    # Check warning threshold
+                    if places_calls >= warning_threshold_places and places_calls < max_places_calls:
+                        logger.warning(f"[{property_type.upper()}] [PLACES] Approaching API limit: {places_calls}/{max_places_calls} calls ({int(places_calls*100/max_places_calls)}%)")
+                    
+                    link = row.get('link')
+                    finnkode = extract_finnkode(link) if link else None
+                    if finnkode:
+                        logger.info(f"[{property_type.upper()}] [PLACES] Property {finnkode}: Making places API call for category '{cat_name}'")
+                    
                     try:
                         nearest = find_nearest_place_in_category(
                             property_lat, property_lng,
@@ -1273,34 +1800,56 @@ def calculate_distances_and_filter(args, input_csv_path=None):
                             radius_meters=search_radius,
                             gmaps_client=gmaps_client
                         )
+                        places_calls += 1  # Track API call (approximate - find_nearby_places makes multiple calls)
                         
                         if nearest and nearest.get('status') == 'OK':
                             df_filtered.at[idx, f'nearest_{prefix}'] = nearest['name']
                             
-                            modes = ['walking']
-                            if cat_config.get('calculate_transit', False):
-                                modes.append('transit')
+                            # Check if we already have the required travel times
+                            modes_needed = []
+                            if pd.isna(df_filtered.at[idx, f'walking_time_{prefix}_minutes']):
+                                modes_needed.append('walking')
+                            if cat_config.get('calculate_transit', False) and pd.isna(df_filtered.at[idx, f'transit_time_{prefix}_minutes']):
+                                modes_needed.append('transit')
                             
-                            travel_times = calculate_travel_time_to_place(
-                                property_lat, property_lng,
-                                nearest['lat'], nearest['lng'],
-                                modes=modes,
-                                gmaps_client=gmaps_client
-                            )
-                            
-                            df_filtered.at[idx, f'walking_time_{prefix}_minutes'] = travel_times.get('walking_minutes')
-                            
-                            if cat_config.get('calculate_transit', False):
-                                df_filtered.at[idx, f'transit_time_{prefix}_minutes'] = travel_times.get('transit_minutes')
-                            
-                            category_found_counts[cat_name] += 1
-                            
-                            walk_str = f"{travel_times.get('walking_minutes'):.1f} min walk" if travel_times.get('walking_minutes') else "N/A"
-                            transit_str = ""
-                            if cat_config.get('calculate_transit', False) and travel_times.get('transit_minutes'):
-                                transit_str = f", {travel_times.get('transit_minutes'):.1f} min transit"
-                            
-                            print(f"  ✅ {cat_name}: {nearest['name']} ({nearest['distance_km']:.2f} km) - {walk_str}{transit_str}")
+                            if not modes_needed:
+                                # Already have all required travel times, skip API call
+                                if finnkode:
+                                    logger.info(f"[{property_type.upper()}] [PLACES] Property {finnkode}: SKIPPED transit time calculation (already have data)")
+                                category_found_counts[cat_name] += 1
+                                walk_str = f"{df_filtered.at[idx, f'walking_time_{prefix}_minutes']:.1f} min walk" if pd.notna(df_filtered.at[idx, f'walking_time_{prefix}_minutes']) else "N/A"
+                                transit_str = ""
+                                if cat_config.get('calculate_transit', False) and pd.notna(df_filtered.at[idx, f'transit_time_{prefix}_minutes']):
+                                    transit_str = f", {df_filtered.at[idx, f'transit_time_{prefix}_minutes']:.1f} min transit"
+                                print(f"  ✅ {cat_name}: {nearest['name']} ({nearest['distance_km']:.2f} km) - {walk_str}{transit_str} (using existing data)")
+                            else:
+                                travel_times = calculate_travel_time_to_place(
+                                    property_lat, property_lng,
+                                    nearest['lat'], nearest['lng'],
+                                    modes=modes_needed,  # Only request modes we need
+                                    gmaps_client=gmaps_client
+                                )
+                                
+                                # Update only the modes we calculated
+                                if 'walking' in modes_needed:
+                                    df_filtered.at[idx, f'walking_time_{prefix}_minutes'] = travel_times.get('walking_minutes')
+                                
+                                if 'transit' in modes_needed and cat_config.get('calculate_transit', False):
+                                    df_filtered.at[idx, f'transit_time_{prefix}_minutes'] = travel_times.get('transit_minutes')
+                                elif cat_config.get('calculate_transit', False):
+                                    # Preserve existing transit time if we didn't request it
+                                    pass
+                                
+                                category_found_counts[cat_name] += 1
+                                
+                                walk_str = f"{travel_times.get('walking_minutes') or df_filtered.at[idx, f'walking_time_{prefix}_minutes']:.1f} min walk" if (travel_times.get('walking_minutes') or pd.notna(df_filtered.at[idx, f'walking_time_{prefix}_minutes'])) else "N/A"
+                                transit_str = ""
+                                if cat_config.get('calculate_transit', False):
+                                    transit_val = travel_times.get('transit_minutes') or df_filtered.at[idx, f'transit_time_{prefix}_minutes']
+                                    if transit_val:
+                                        transit_str = f", {transit_val:.1f} min transit"
+                                
+                                print(f"  ✅ {cat_name}: {nearest['name']} ({nearest['distance_km']:.2f} km) - {walk_str}{transit_str}")
                         else:
                             print(f"  ⚠️  {cat_name}: No places found within {search_radius / 1000:.1f} km")
                             
@@ -1405,27 +1954,94 @@ def calculate_distances_and_filter(args, input_csv_path=None):
         print(f"🧹 Cleaned price column (removed 'kr' suffix and non-numeric characters)")
     
     # ================================================
-    # SAVE property_listings_complete.csv (ALL properties)
+    # SAVE property_listings_complete.csv (ALL properties) - type-aware
     # ================================================
     # This file contains ALL properties (completed + incomplete) for reference
-    output_file_complete = os.path.join(output_dir, f'property_listings_complete{file_suffix}.csv')
+    output_filename_complete = get_type_aware_filename('property_listings_complete', property_type, file_suffix)
+    output_file_complete = os.path.join(output_dir, output_filename_complete)
     df_valid.to_csv(output_file_complete, index=False, encoding='utf-8')
     print(f"💾 Saved ALL property listings to: {output_file_complete}")
     print(f"   Total properties: {len(df_valid)} (completed: {completed}, incomplete: {incomplete})")
     
     # ================================================
-    # SAVE property_listings_with_distances.csv (ONLY completed properties)
+    # SAVE property_listings_with_distances.csv (PROCESSED properties) - type-aware
     # ================================================
-    # This is the source of truth for duplicate checking - only contains fully processed properties
-    output_file_final = os.path.join(output_dir, f'property_listings_with_distances{file_suffix}.csv')
+    # This is the source of truth for duplicate checking - contains all processed properties
+    # For sales: Save all properties with coordinates and work distance (even if place data incomplete)
+    # For rental: Save only fully completed properties (with all place data)
+    output_filename_final = get_type_aware_filename('property_listings_with_distances', property_type, file_suffix)
+    output_file_final = os.path.join(output_dir, output_filename_final)
     
-    # Filter to only completed properties
-    df_completed = df_valid[df_valid['processing_status'] == 'completed'].copy()
+    if property_type == 'sales':
+        # For sales: Save all properties that have been geocoded (successfully processed from emails)
+        # This ensures all sales properties from emails are included, even if distance/place data incomplete
+        # Priority: geocoded > has work distance > fully completed
+        if 'geocode_status' in df_valid.columns:
+            df_to_save = df_valid[df_valid['geocode_status'] == 'Success'].copy()
+        else:
+            # Fallback: if no geocode_status, save all properties with coordinates
+            df_to_save = df_valid[
+                (df_valid['latitude'].notna()) & 
+                (df_valid['longitude'].notna())
+            ].copy()
+        
+        # #region agent log
+        target_finnkodes = ['437802416', '442148776', '435383650']
+        for target_fk in target_finnkodes:
+            if 'link' in df_to_save.columns:
+                matching = df_to_save[df_to_save['link'].str.contains(target_fk, na=False)]
+                if len(matching) > 0:
+                    import json
+                    try:
+                        with open('/Users/isuruwarakagoda/Projects/.cursor/debug.log', 'a') as f:
+                            f.write(json.dumps({
+                                'sessionId': 'debug-session',
+                                'runId': 'run1',
+                                'hypothesisId': 'D',
+                                'location': 'distance_calculator.py:1582',
+                                'message': f'Property {target_fk} in df_to_save',
+                                'data': {'finnkode': target_fk, 'geocode_status': matching.iloc[0].get('geocode_status'), 'has_distance': pd.notna(matching.iloc[0].get('distance_to_work_km'))},
+                                'timestamp': int(time.time() * 1000)
+                            }) + '\n')
+                    except: pass
+                else:
+                    import json
+                    try:
+                        with open('/Users/isuruwarakagoda/Projects/.cursor/debug.log', 'a') as f:
+                            f.write(json.dumps({
+                                'sessionId': 'debug-session',
+                                'runId': 'run1',
+                                'hypothesisId': 'D',
+                                'location': 'distance_calculator.py:1582',
+                                'message': f'Property {target_fk} NOT in df_to_save',
+                                'data': {'finnkode': target_fk, 'df_to_save_count': len(df_to_save), 'df_valid_count': len(df_valid)},
+                                'timestamp': int(time.time() * 1000)
+                            }) + '\n')
+                    except: pass
+        # #endregion
+        
+        print(f"💾 Saving PROCESSED sales properties (all geocoded properties from emails) to: {output_file_final}")
+        print(f"   Processed sales properties: {len(df_to_save)}")
+        if len(df_to_save) > 0:
+            with_distance = df_to_save['distance_to_work_km'].notna().sum() if 'distance_to_work_km' in df_to_save.columns else 0
+            print(f"   Properties with work distance: {with_distance}/{len(df_to_save)}")
+    else:
+        # For rental: Save only fully completed properties (with all place data)
+        df_to_save = df_valid[df_valid['processing_status'] == 'completed'].copy()
+        print(f"💾 Saving COMPLETED rental properties (fully processed with all place data) to: {output_file_final}")
+        print(f"   Completed rental properties: {len(df_to_save)}")
     
-    # Save ONLY completed properties to property_listings_with_distances.csv
-    df_completed.to_csv(output_file_final, index=False, encoding='utf-8')
-    print(f"💾 Saved COMPLETED properties to: {output_file_final}")
-    print(f"   Completed properties: {len(df_completed)}")
+    # Save processed properties to property_listings_with_distances.csv
+    df_to_save.to_csv(output_file_final, index=False, encoding='utf-8')
+    print(f"✅ Saved {len(df_to_save)} properties to: {output_file_final}")
+    
+    # Print API usage summary
+    print("\n" + "="*70)
+    print("API USAGE SUMMARY")
+    print("="*70)
+    print(f"📊 Distance Matrix API: {distance_matrix_calls}/{max_distance_matrix_calls} calls ({int(distance_matrix_calls*100/max_distance_matrix_calls)}%)")
+    print(f"📊 Places API: {places_calls}/{max_places_calls} calls ({int(places_calls*100/max_places_calls)}%)")
+    logger.info(f"[{property_type.upper()}] API Usage Summary - Distance Matrix: {distance_matrix_calls}/{max_distance_matrix_calls}, Places: {places_calls}/{max_places_calls}")
     
     print()
     print("="*70)

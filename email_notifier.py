@@ -15,11 +15,14 @@ from datetime import datetime
 
 def send_property_results_notification(
     csv_with_distances_path,
+    excel_attachment_path=None,
     recipient_email=None,
-    test_mode=False
+    test_mode=False,
+    property_type='rental',
+    type_config=None
 ):
     """
-    Send email notification with CSV file attachment.
+    Send email notification with file attachments.
     
     First Principles:
     - MIMEMultipart: Creates an email that can have multiple parts (text + attachments)
@@ -29,8 +32,11 @@ def send_property_results_notification(
     
     Args:
         csv_with_distances_path (str): Path to property_listings_with_distances.csv
+        excel_attachment_path (str, optional): Path to filtered Excel file from data_formatter
         recipient_email (str, optional): Email address to send to (defaults to sender)
         test_mode (bool): If True, skip sending email notification
+        property_type (str): 'rental' or 'sales' (default: 'rental' for backward compatibility)
+        type_config (dict, optional): Configuration dict for this property type (used for subject prefix)
     
     Returns:
         bool: True if email sent successfully, False otherwise
@@ -119,10 +125,30 @@ def send_property_results_notification(
     # ============================================
     print("\n📧 Creating email message...")
     
+    # Determine subject prefix from type_config or use default
+    if type_config and 'email' in type_config and 'subject_prefix' in type_config['email']:
+        subject_prefix = type_config['email']['subject_prefix']
+    else:
+        # Default based on property type
+        if property_type == 'sales':
+            subject_prefix = 'New Sales Matches'
+        else:
+            subject_prefix = 'New Rental Matches'
+    
     msg = MIMEMultipart()
     msg['From'] = sender_email
     msg['To'] = recipient_email
-    msg['Subject'] = f"🏠 Property Finder: {count_all} Properties Ready! ({datetime.now().strftime('%Y-%m-%d')})"
+    msg['Subject'] = f"🏠 {subject_prefix}: {count_all} Properties Ready! ({datetime.now().strftime('%Y-%m-%d')})"
+    
+    # Check if Excel file exists
+    has_excel = excel_attachment_path and os.path.exists(excel_attachment_path)
+    
+    # Build file list for email body (use actual filenames from paths)
+    csv_filename = os.path.basename(csv_with_distances_path)
+    files_list = f"""<li>{csv_filename} - All completed properties with distance calculations and nearby gyms</li>"""
+    if has_excel:
+        excel_filename = os.path.basename(excel_attachment_path)
+        files_list += f"""<li>{excel_filename} - <strong>Filtered properties</strong> based on your custom criteria (Excel format with formatting)</li>"""
     
     # Create email body
     body = f"""
@@ -133,14 +159,14 @@ def send_property_results_notification(
         
         <h3>Summary:</h3>
         <ul>
-          <li><strong>Completed properties with distances:</strong> {count_all} properties</li>
+          <li><strong>All completed properties:</strong> {count_all} properties</li>
         </ul>
         
-        <p>The CSV file is attached to this email. Download and open it to view the results.</p>
+        <p>{'The files are' if has_excel else 'The file is'} attached to this email. Download and open to view the results.</p>
         
-        <p>File attached:</p>
+        <p>Files attached:</p>
         <ul>
-          <li>property_listings_with_distances.csv - Completed properties with distance calculations and nearby gyms</li>
+          {files_list}
         </ul>
         
         <p>Best regards,<br>Property Finder Automation</p>
@@ -151,13 +177,24 @@ def send_property_results_notification(
     # Attach the HTML body
     msg.attach(MIMEText(body, 'html'))
     
-    # Attach the CSV file
+    # Attach the CSV file (use actual filename from path)
     try:
-        attach_file(msg, csv_with_distances_path, "property_listings_with_distances.csv")
+        csv_attachment_name = os.path.basename(csv_with_distances_path)
+        attach_file(msg, csv_with_distances_path, csv_attachment_name)
         print("   ✅ CSV file attached successfully")
     except Exception as e:
-        print(f"❌ Error attaching file: {e}")
+        print(f"❌ Error attaching CSV file: {e}")
         return False
+    
+    # Attach the Excel file (if provided and exists)
+    if has_excel:
+        try:
+            excel_filename = os.path.basename(excel_attachment_path)
+            attach_file(msg, excel_attachment_path, excel_filename)
+            print(f"   ✅ Excel file attached successfully ({excel_filename})")
+        except Exception as e:
+            print(f"⚠️  Warning: Could not attach Excel file: {e}")
+            # Continue without Excel attachment - not a fatal error
     
     # ============================================
     # SEND EMAIL

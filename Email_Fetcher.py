@@ -13,7 +13,7 @@ load_dotenv(dotenv_path='.env')  # Loads your Email.env file
 from bs4 import BeautifulSoup  # Add this import
 from urllib.parse import unquote  # For URL decoding
 from tracking_summary import tracker
-from config import CONFIG
+from config import CONFIG, get_type_aware_filename
 
 EMAIL = os.getenv('EMAIL')
 PASSWORD = os.getenv('PASSWORD')
@@ -351,49 +351,71 @@ def extract_finnkode(url):
         return None
 
 
-def normalize_finn_url(url):
+def normalize_finn_url(url, property_type='rental'):
     """
     Normalize a Finn.no URL to a consistent direct URL format.
     
-    Converts tracking URLs and malformed URLs to the standard format:
-    https://www.finn.no/realestate/lettings/ad.html?finnkode=XXXXXXXXX
+    For sales properties: converts to short format https://www.finn.no/{finnkode}
+    For rental properties: Only normalizes if URL is in tracking format, otherwise preserves existing format
+      (backward compatibility - keeps working rental URLs unchanged)
     
     Args:
         url (str): Any Finn.no URL format
+        property_type (str): 'rental' or 'sales' (default: 'rental')
         
     Returns:
-        str: Normalized direct URL, or original URL if normalization fails
+        str: Normalized direct URL, or original URL if normalization fails or already in correct format
     """
     if not url or not isinstance(url, str):
         return url
     
     finnkode = extract_finnkode(url)
     if finnkode:
-        return f"https://www.finn.no/realestate/lettings/ad.html?finnkode={finnkode}"
+        if property_type == 'sales':
+            # For sales, always use short format
+            return f"https://www.finn.no/{finnkode}"
+        else:
+            # For rental, preserve existing format if already normalized
+            # Only normalize if it's a tracking URL or malformed URL
+            if 'realestate/lettings/ad.html' in url:
+                # Already in correct rental format, keep as-is (backward compatibility)
+                return url
+            elif 'click.mailsvc.finn.no' in url or 'finnMail=' in url:
+                # Tracking URL, normalize it
+                return f"https://www.finn.no/realestate/lettings/ad.html?finnkode={finnkode}"
+            else:
+                # Other format, normalize to standard rental format
+                return f"https://www.finn.no/realestate/lettings/ad.html?finnkode={finnkode}"
     
     # If we can't extract finnkode, return the decoded URL at least
     return decode_finn_tracking_url(url)
 
 
-def merge_with_master_listings(email_df, master_csv_path='master_listings.csv', output_dir='output', file_suffix=''):
+def merge_with_master_listings(email_df, master_csv_path=None, output_dir='output', file_suffix='', property_type='rental'):
     """
-    Merge email-fetched properties with master_listings.csv.
+    Merge email-fetched properties with master listings CSV.
     
     This function:
     1. Loads processed finnkodes from property_listings_with_distances.csv (already processed)
-    2. Loads master_listings.csv and normalizes column names
+    2. Loads master listings CSV (rental or sales) and normalizes column names
     3. Filters out master listings that have already been processed
     4. Extracts finnkode from both datasets for deduplication
     5. Prefers email-fetched data when duplicates exist (same finnkode)
-    6. Adds non-duplicate, unprocessed properties from master_listings
+    6. Adds non-duplicate, unprocessed properties from master listings
     7. Normalizes all URLs to direct Finn.no format
+    
+    For rentals: loads master_listings.csv (comma-delimited)
+    For sales: loads master_listings_sales.csv (semicolon-delimited)
     
     Args:
         email_df (DataFrame): Properties fetched from emails with columns:
                               title, address, price, size, link
-        master_csv_path (str): Path to master_listings.csv
+        master_csv_path (str, optional): Path to master listings CSV. If None, auto-determined
+                                         based on property_type (rental → master_listings.csv,
+                                         sales → master_listings_sales.csv)
         output_dir (str): Directory where property_listings_with_distances.csv is stored
         file_suffix (str): Suffix to append to filename (e.g., '_test')
+        property_type (str): 'rental' or 'sales' (default: 'rental')
         
     Returns:
         DataFrame: Merged properties with columns: title, address, price, size, link
@@ -402,20 +424,31 @@ def merge_with_master_listings(email_df, master_csv_path='master_listings.csv', 
     print("MERGING WITH MASTER LISTINGS")
     print("="*70)
     
-    # Load processed finnkodes from property_listings_with_distances.csv
-    processed_finnkodes = load_processed_finnkodes_from_distances_csv(output_dir, file_suffix)
+    # Determine master CSV path based on property_type if not provided
+    if master_csv_path is None:
+        if property_type == 'sales':
+            master_csv_path = 'master_listings_sales.csv'
+        else:
+            master_csv_path = 'master_listings.csv'
+    
+    # Load processed finnkodes from property_listings_with_distances.csv (type-aware)
+    processed_finnkodes = load_processed_finnkodes_from_distances_csv(output_dir, file_suffix, property_type)
     if processed_finnkodes:
         print(f"📊 Found {len(processed_finnkodes)} already processed properties (will skip from master)")
     
-    # Check if master_listings.csv exists
+    # Check if master listings CSV exists
     if not os.path.exists(master_csv_path):
         print(f"⚠️  Master listings file not found: {master_csv_path}")
         print("   Continuing with email-fetched properties only")
         return email_df
     
     try:
-        # Load master_listings.csv
-        master_df = pd.read_csv(master_csv_path)
+        # Load master listings CSV with appropriate delimiter
+        # Sales CSV uses semicolon, rental CSV uses comma
+        if property_type == 'sales':
+            master_df = pd.read_csv(master_csv_path, sep=';')
+        else:
+            master_df = pd.read_csv(master_csv_path)
         print(f"📂 Loaded {len(master_df)} properties from {master_csv_path}")
         
         # Normalize column names: Title→title, Address→address, etc.
@@ -432,7 +465,7 @@ def merge_with_master_listings(email_df, master_csv_path='master_listings.csv', 
         required_cols = ['title', 'address', 'price', 'size', 'link']
         for col in required_cols:
             if col not in master_df.columns:
-                print(f"⚠️  Warning: Missing column '{col}' in master_listings.csv")
+                print(f"⚠️  Warning: Missing column '{col}' in {master_csv_path}")
                 master_df[col] = 'Unknown'
         
         # Keep only required columns
@@ -492,11 +525,11 @@ def merge_with_master_listings(email_df, master_csv_path='master_listings.csv', 
         master_unique['date_read'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
         # Normalize links in master_unique to direct Finn.no URL format
-        master_unique['link'] = master_unique['link'].apply(normalize_finn_url)
+        master_unique['link'] = master_unique['link'].apply(lambda x: normalize_finn_url(x, property_type=property_type))
         
         # Normalize links in email_df (convert tracking URLs to direct URLs)
         if len(email_df) > 0:
-            email_df['link'] = email_df['link'].apply(normalize_finn_url)
+            email_df['link'] = email_df['link'].apply(lambda x: normalize_finn_url(x, property_type=property_type))
         
         # Remove internal columns before merging
         if '_finnkode' in email_df.columns:
@@ -608,7 +641,9 @@ def fetch_finn_emails(days_back=None, subject_keywords=None,
     return emails, mailbox
 
 def parse_properties_from_email(msg, debug=False):
-    
+    # #region agent log
+    import json; open('/Users/isuruwarakagoda/Projects/.cursor/debug.log', 'a').write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"Email_Fetcher.py:638","message":"parse_properties_from_email entry","data":{"debug":debug,"has_html":bool(msg.html if msg else False)},"timestamp":int(__import__('time').time()*1000)})+'\n')
+    # #endregion
     """
     Parse property details from a Finn.no email HTML.
     
@@ -621,12 +656,18 @@ def parse_properties_from_email(msg, debug=False):
     """
 
     if not msg.html:
+        # #region agent log
+        import json; open('/Users/isuruwarakagoda/Projects/.cursor/debug.log', 'a').write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"Email_Fetcher.py:651","message":"No HTML in email","data":{},"timestamp":int(__import__('time').time()*1000)})+'\n')
+        # #endregion
         if debug:
             print("  [DEBUG] No HTML content in email")
         return []  # Skip if no HTML body
     
     soup = BeautifulSoup(msg.html, 'html.parser')
     properties = []
+    # #region agent log
+    import json; open('/Users/isuruwarakagoda/Projects/.cursor/debug.log', 'a').write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"Email_Fetcher.py:657","message":"After BeautifulSoup parse","data":{"html_length":len(msg.html)},"timestamp":int(__import__('time').time()*1000)})+'\n')
+    # #endregion
 
     # Find all property listing divs - try multiple patterns
     # Pattern 1: Old format - class contains "idIAvL"
@@ -641,6 +682,9 @@ def parse_properties_from_email(msg, debug=False):
             if debug:
                 print(f"  [DEBUG] Using ResponsiveList pattern: {len(listing_divs)} divs found")
     
+    # #region agent log
+    import json; open('/Users/isuruwarakagoda/Projects/.cursor/debug.log', 'a').write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"Email_Fetcher.py:673","message":"After finding listing_divs","data":{"listing_divs_count":len(listing_divs)},"timestamp":int(__import__('time').time()*1000)})+'\n')
+    # #endregion
     if debug:
         print(f"  [DEBUG] Found {len(listing_divs)} divs with property listings")
         # Also check for alternative patterns
@@ -664,10 +708,19 @@ def parse_properties_from_email(msg, debug=False):
             title = 'Unknown'
             
             if is_new_format:
-                # New format: link is directly in the div, title is link text
-                link_elem = listing_div.find('a', href=lambda h: h and 'finn.no' in str(h))
-                if link_elem:
-                    title = link_elem.get_text(strip=True)
+                # New format: try multiple patterns
+                # Pattern 1: link in <h3><a> tag (most common in new format)
+                title_link = listing_div.find('h3')
+                if title_link:
+                    link_elem = title_link.find('a', href=lambda h: h and 'finn.no' in str(h))
+                    if link_elem:
+                        title = link_elem.get_text(strip=True)
+                
+                # Pattern 2: fallback to link directly in the div (if h3 pattern didn't work)
+                if not link_elem or not title or title == 'Unknown':
+                    link_elem = listing_div.find('a', href=lambda h: h and 'finn.no' in str(h))
+                    if link_elem and link_elem.get_text(strip=True):
+                        title = link_elem.get_text(strip=True)
             else:
                 # Old format: link is in an <h3><a> tag
                 title_link = listing_div.find('h3')
@@ -702,18 +755,40 @@ def parse_properties_from_email(msg, debug=False):
             street_address = 'Unknown'
             
             if is_new_format:
-                # New format: extract from text parts
-                text_parts = [t.strip() for t in listing_div.stripped_strings if t.strip() and len(t.strip()) > 2]
-                # Pattern: title, price, location, street, "Privat"
-                for i, text in enumerate(text_parts):
-                    if 'kr' in text:
-                        # Next non-price, non-Privat text is usually location
-                        if i + 1 < len(text_parts) and text_parts[i + 1] != 'Privat' and 'kr' not in text_parts[i + 1]:
-                            location = text_parts[i + 1]
-                        # After location, next non-Privat is usually street
-                        if i + 2 < len(text_parts) and text_parts[i + 2] != 'Privat' and 'kr' not in text_parts[i + 2]:
-                            street_address = text_parts[i + 2]
-                        break
+                # New format: try multiple extraction methods
+                # Method 1: Use specific class names (works for sales emails without prices)
+                location_span = listing_div.find('span', class_=lambda c: c and 'SecondaryText' in str(c))
+                if location_span:
+                    location = location_span.get_text(strip=True)
+                
+                # Extract street address from AlertAd__Field paragraphs
+                address_fields = listing_div.find_all('p', class_=lambda c: c and 'AlertAd__Field' in str(c))
+                for p in address_fields:
+                    text = p.get_text(strip=True)
+                    # Skip empty, "Privat", and company names (usually longer and contain "AS" or "AS" or similar)
+                    if text and text != 'Privat' and 'kr' not in text and len(text) > 3:
+                        # First non-empty field is usually the street address
+                        if street_address == 'Unknown':
+                            street_address = text
+                        # If we already have one, check if this looks more like an address (shorter, no company indicators)
+                        elif len(text) < len(street_address) and 'AS' not in text.upper() and 'Eiendom' not in text:
+                            street_address = text
+                
+                # Method 2: Fallback to text parts parsing (for rentals with prices)
+                if location == 'Unknown' or street_address == 'Unknown':
+                    text_parts = [t.strip() for t in listing_div.stripped_strings if t.strip() and len(t.strip()) > 2]
+                    # Pattern: title, price, location, street, "Privat"
+                    for i, text in enumerate(text_parts):
+                        if 'kr' in text:
+                            # Next non-price, non-Privat text is usually location
+                            if i + 1 < len(text_parts) and text_parts[i + 1] != 'Privat' and 'kr' not in text_parts[i + 1]:
+                                if location == 'Unknown':
+                                    location = text_parts[i + 1]
+                            # After location, next non-Privat is usually street
+                            if i + 2 < len(text_parts) and text_parts[i + 2] != 'Privat' and 'kr' not in text_parts[i + 2]:
+                                if street_address == 'Unknown':
+                                    street_address = text_parts[i + 2]
+                            break
             else:
                 # Old format: extract location from spans
                 all_spans = listing_div.find_all('span')
@@ -761,6 +836,26 @@ def parse_properties_from_email(msg, debug=False):
             # Check if the address is ambiguous (needs manual enhancement)
             address_is_ambiguous = is_ambiguous_address(full_address)
 
+            # Extract finnkode for logging
+            finnkode = extract_finnkode(decoded_url) if decoded_url else None
+            
+            # #region agent log
+            if finnkode in ['437802416', '442148776', '435383650']:
+                import json
+                try:
+                    with open('/Users/isuruwarakagoda/Projects/.cursor/debug.log', 'a') as f:
+                        f.write(json.dumps({
+                            'sessionId': 'debug-session',
+                            'runId': 'run1',
+                            'hypothesisId': 'A',
+                            'location': 'Email_Fetcher.py:825',
+                            'message': f'Property {finnkode} extracted from email',
+                            'data': {'finnkode': finnkode, 'title': title[:50], 'address': full_address, 'is_ambiguous': address_is_ambiguous},
+                            'timestamp': int(datetime.now().timestamp() * 1000)
+                        }) + '\n')
+                except: pass
+            # #endregion
+            
             properties.append({
                 'title': title,
                 'address': full_address,
@@ -772,11 +867,27 @@ def parse_properties_from_email(msg, debug=False):
                 'date_read': datetime.now().strftime('%Y-%m-%d %H:%M:%S')  # Timestamp when listing was read
             })
             
+            # Log property extraction
+            if finnkode:
+                import logging
+                logger = logging.getLogger('email_fetch')
+                if not logger.handlers:
+                    logger.setLevel(logging.INFO)
+                    handler = logging.StreamHandler()
+                    handler.setFormatter(logging.Formatter('%(asctime)s - [%(levelname)s] - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+                    logger.addHandler(handler)
+                logger.info(f"[EMAIL_FETCH] Property {finnkode}: Extracted from email - '{title}' at '{full_address}'")
+            
         except Exception as e:
+            # #region agent log
+            import json, traceback; open('/Users/isuruwarakagoda/Projects/.cursor/debug.log', 'a').write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"Email_Fetcher.py:876","message":"Listing parsing exception","data":{"error":str(e),"traceback":traceback.format_exc()},"timestamp":int(__import__('time').time()*1000)})+'\n')
+            # #endregion
             # Skip this listing if there's an error
             print(f"Error parsing listing: {e}")
             continue
-
+    # #region agent log
+    import json; open('/Users/isuruwarakagoda/Projects/.cursor/debug.log', 'a').write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"Email_Fetcher.py:881","message":"parse_properties_from_email return","data":{"properties_count":len(properties)},"timestamp":int(__import__('time').time()*1000)})+'\n')
+    # #endregion
     return properties  # Return the list of properties
 
 
@@ -784,26 +895,30 @@ def parse_properties_from_email(msg, debug=False):
 # MAIN WORKFLOW FUNCTION (for use by property_finder.py)
 # ============================================
 
-def load_existing_property_links(output_dir='output', file_suffix=''):
+def load_existing_property_links(output_dir='output', file_suffix='', property_type='rental'):
     """
     Load existing property links from the latest CSV file to filter duplicates.
     
     Args:
         output_dir: Directory where CSV files are stored
         file_suffix: Suffix to append to filename (e.g., '_test')
+        property_type: 'rental' or 'sales' (default: 'rental' for backward compat)
     
     Returns:
         set: Set of property links (tracking URLs) already in the CSV
     """
     # Check both the test and production CSVs if needed
-    latest_csv = os.path.join(output_dir, f'property_listings_latest{file_suffix}.csv')
+    latest_filename = get_type_aware_filename('property_listings_latest', property_type, file_suffix)
+    latest_csv = os.path.join(output_dir, latest_filename)
     
-    # Also check the production CSV if we're in test mode
-    prod_csv = os.path.join('output', 'property_listings_latest.csv')
+    # Also check the production CSV if we're in test mode (backward compatibility - check old naming)
+    prod_csv_old = os.path.join('output', 'property_listings_latest.csv')
+    prod_csv_new = os.path.join('output', get_type_aware_filename('property_listings_latest', property_type, ''))
     
     existing_links = set()
     
-    for csv_path in [latest_csv, prod_csv]:
+    # Check all possible file locations (for backward compatibility)
+    for csv_path in [latest_csv, prod_csv_old, prod_csv_new]:
         if os.path.exists(csv_path):
             try:
                 df = pd.read_csv(csv_path)
@@ -815,7 +930,7 @@ def load_existing_property_links(output_dir='output', file_suffix=''):
     return existing_links
 
 
-def load_processed_finnkodes_from_distances_csv(output_dir='output', file_suffix=''):
+def load_processed_finnkodes_from_distances_csv(output_dir='output', file_suffix='', property_type='rental'):
     """
     Load processed finnkodes from property_listings_with_distances.csv.
     This is the source of truth for properties that have completed the full pipeline.
@@ -823,25 +938,72 @@ def load_processed_finnkodes_from_distances_csv(output_dir='output', file_suffix
     Args:
         output_dir: Directory where CSV files are stored
         file_suffix: Suffix to append to filename (e.g., '_test')
+        property_type: 'rental' or 'sales' (default: 'rental' for backward compat)
     
     Returns:
         set: Set of finnkodes (strings) that have been fully processed
     """
-    distances_csv = os.path.join(output_dir, f'property_listings_with_distances{file_suffix}.csv')
+    distances_filename = get_type_aware_filename('property_listings_with_distances', property_type, file_suffix)
+    distances_csv = os.path.join(output_dir, distances_filename)
     
     processed_finnkodes = set()
     
+    # Check both old and new naming for backward compatibility
     if os.path.exists(distances_csv):
-        try:
-            df = pd.read_csv(distances_csv)
-            if 'link' in df.columns:
-                # Extract finnkode from each link
-                for link in df['link'].dropna():
-                    finnkode = extract_finnkode(link)
-                    if finnkode:
-                        processed_finnkodes.add(finnkode)
-        except Exception as e:
-            print(f"⚠️  Warning: Could not load processed finnkodes from {distances_csv}: {e}")
+        # Check if file is empty
+        file_size = os.path.getsize(distances_csv)
+        if file_size > 0:
+            try:
+                df = pd.read_csv(distances_csv)
+                # Check if dataframe is empty (only has header)
+                if len(df) > 0 and 'link' in df.columns:
+                    # Extract finnkode from each link
+                    for link in df['link'].dropna():
+                        finnkode = extract_finnkode(link)
+                        if finnkode:
+                            processed_finnkodes.add(finnkode)
+                    
+                    # #region agent log
+                    target_finnkodes = ['437802416', '442148776', '435383650']
+                    for target_fk in target_finnkodes:
+                        if target_fk in processed_finnkodes:
+                            import json
+                            try:
+                                with open('/Users/isuruwarakagoda/Projects/.cursor/debug.log', 'a') as f:
+                                    f.write(json.dumps({
+                                        'sessionId': 'debug-session',
+                                        'runId': 'run1',
+                                        'hypothesisId': 'C',
+                                        'location': 'Email_Fetcher.py:943',
+                                        'message': f'Property {target_fk} in processed_finnkodes (will be filtered)',
+                                        'data': {'finnkode': target_fk, 'processed_count': len(processed_finnkodes)},
+                                        'timestamp': int(datetime.now().timestamp() * 1000)
+                                    }) + '\n')
+                            except: pass
+                    # #endregion
+            except pd.errors.EmptyDataError:
+                # File exists but has no data (empty or only header)
+                pass
+            except Exception as e:
+                print(f"⚠️  Warning: Could not load processed finnkodes from {distances_csv}: {e}")
+    else:
+        # Try old naming for backward compatibility
+        old_distances_csv = os.path.join(output_dir, f'property_listings_with_distances{file_suffix}.csv')
+        if os.path.exists(old_distances_csv):
+            file_size = os.path.getsize(old_distances_csv)
+            if file_size > 0:
+                try:
+                    df = pd.read_csv(old_distances_csv)
+                    if len(df) > 0 and 'link' in df.columns:
+                        for link in df['link'].dropna():
+                            finnkode = extract_finnkode(link)
+                            if finnkode:
+                                processed_finnkodes.add(finnkode)
+                except pd.errors.EmptyDataError:
+                    # File exists but has no data
+                    pass
+                except Exception as e:
+                    print(f"⚠️  Warning: Could not load processed finnkodes from {old_distances_csv}: {e}")
     
     return processed_finnkodes
 
@@ -871,6 +1033,10 @@ def fetch_and_parse_emails_workflow(args):
     reprocess_emails = getattr(args, 'reprocess_emails', False)
     days_back = getattr(args, 'days_back', CONFIG['days_back'])
     subject_keywords = getattr(args, 'subject_keywords', CONFIG['subject_keywords'])
+    property_type = getattr(args, 'property_type', 'rental')  # Get property_type from args
+    # #region agent log
+    import json; open('/Users/isuruwarakagoda/Projects/.cursor/debug.log', 'a').write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"Email_Fetcher.py:1015","message":"fetch_and_parse_emails_workflow entry","data":{"property_type":property_type,"output_dir":output_dir},"timestamp":int(__import__('time').time()*1000)})+'\n')
+    # #endregion
     
     # Load existing property links to filter duplicates
     # In test mode, don't filter duplicates - we want to test the full workflow
@@ -878,7 +1044,7 @@ def fetch_and_parse_emails_workflow(args):
         existing_links = set()
         print("🧪 TEST MODE: Not filtering duplicates - testing full workflow")
     else:
-        existing_links = load_existing_property_links(output_dir, file_suffix)
+        existing_links = load_existing_property_links(output_dir, file_suffix, property_type)
         if existing_links:
             print(f"📋 Found {len(existing_links)} existing properties in CSV files")
     
@@ -925,7 +1091,13 @@ def fetch_and_parse_emails_workflow(args):
             # Parse properties from email
             # Enable debug logging if we're having issues (can be made configurable)
             debug_parsing = True  # Set to True to enable debug output
+            # #region agent log
+            import json; open('/Users/isuruwarakagoda/Projects/.cursor/debug.log', 'a').write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"Email_Fetcher.py:1069","message":"Before parse_properties_from_email","data":{"property_type":property_type,"email_index":i,"email_subject":msg.subject[:50],"has_html":bool(msg.html)},"timestamp":int(__import__('time').time()*1000)})+'\n')
+            # #endregion
             props = parse_properties_from_email(msg, debug=debug_parsing)
+            # #region agent log
+            import json; open('/Users/isuruwarakagoda/Projects/.cursor/debug.log', 'a').write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"Email_Fetcher.py:1072","message":"After parse_properties_from_email","data":{"property_type":property_type,"props_count":len(props) if props else 0,"props_sample":props[:2] if props else []},"timestamp":int(__import__('time').time()*1000)})+'\n')
+            # #endregion
 
             # Check if any properties were found
             if not props:
@@ -964,7 +1136,12 @@ def fetch_and_parse_emails_workflow(args):
             time.sleep(2)  # Wait 2 seconds between emails
 
         except Exception as e:
+            # #region agent log
+            import json, traceback; open('/Users/isuruwarakagoda/Projects/.cursor/debug.log', 'a').write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"Email_Fetcher.py:1108","message":"Email parsing exception","data":{"property_type":property_type,"email_index":i,"error":str(e),"traceback":traceback.format_exc()},"timestamp":int(__import__('time').time()*1000)})+'\n')
+            # #endregion
             print(f"❌ Error: {e}")
+            import traceback
+            traceback.print_exc()
             email_success = False
             time.sleep(2)
             continue
@@ -1024,7 +1201,7 @@ def fetch_and_parse_emails_workflow(args):
         
         # Merge with master_listings.csv (skip in test mode to avoid modifying master data)
         if not test_mode:
-            df_normal = merge_with_master_listings(df_normal_for_merge, output_dir=output_dir, file_suffix=file_suffix)
+            df_normal = merge_with_master_listings(df_normal_for_merge, output_dir=output_dir, file_suffix=file_suffix, property_type=property_type)
         else:
             print("\n🧪 TEST MODE: Skipping merge with master_listings.csv")
             df_normal = df_normal_for_merge
@@ -1033,7 +1210,7 @@ def fetch_and_parse_emails_workflow(args):
         # CHECK DUPLICATES AGAINST PROCESSED PROPERTIES
         # ============================================
         if len(df_normal) > 0 and not test_mode:
-            processed_finnkodes = load_processed_finnkodes_from_distances_csv(output_dir, file_suffix)
+            processed_finnkodes = load_processed_finnkodes_from_distances_csv(output_dir, file_suffix, property_type)
             if processed_finnkodes:
                 # Extract finnkode from merged properties
                 df_normal = df_normal.copy()
@@ -1043,6 +1220,26 @@ def fetch_and_parse_emails_workflow(args):
                 before_count = len(df_normal)
                 duplicates_mask = df_normal['_finnkode'].isin(processed_finnkodes)
                 duplicate_count = duplicates_mask.sum()
+                
+                # #region agent log
+                target_finnkodes = ['437802416', '442148776', '435383650']
+                for target_fk in target_finnkodes:
+                    if target_fk in df_normal['_finnkode'].values:
+                        is_duplicate = target_fk in processed_finnkodes
+                        import json
+                        try:
+                            with open('/Users/isuruwarakagoda/Projects/.cursor/debug.log', 'a') as f:
+                                f.write(json.dumps({
+                                    'sessionId': 'debug-session',
+                                    'runId': 'run1',
+                                    'hypothesisId': 'B',
+                                    'location': 'Email_Fetcher.py:1150',
+                                    'message': f'Property {target_fk} in deduplication check',
+                                    'data': {'finnkode': target_fk, 'is_duplicate': is_duplicate, 'in_processed_finnkodes': target_fk in processed_finnkodes, 'processed_count': len(processed_finnkodes)},
+                                    'timestamp': int(datetime.now().timestamp() * 1000)
+                                }) + '\n')
+                        except: pass
+                # #endregion
                 
                 tracker.stats['step3_deduplication']['before_count'] = before_count
                 tracker.stats['step3_deduplication']['duplicates_removed'] = duplicate_count
@@ -1117,12 +1314,14 @@ def fetch_and_parse_emails_workflow(args):
         # Create output directory if it doesn't exist
         os.makedirs(output_dir, exist_ok=True)
         
-        # Generate filename with timestamp and suffix
+        # Generate filename with timestamp and suffix (type-aware)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        csv_filename = os.path.join(output_dir, f'property_listings_{timestamp}{file_suffix}.csv')
+        base_filename = get_type_aware_filename(f'property_listings_{timestamp}', property_type, file_suffix)
+        csv_filename = os.path.join(output_dir, base_filename)
         
-        # Also create a "latest" version for easy access (with suffix)
-        latest_filename = os.path.join(output_dir, f'property_listings_latest{file_suffix}.csv')
+        # Also create a "latest" version for easy access (with suffix, type-aware)
+        latest_base_filename = get_type_aware_filename('property_listings_latest', property_type, file_suffix)
+        latest_filename = os.path.join(output_dir, latest_base_filename)
         
         try:
             # Only export normal addresses to main CSV
@@ -1204,11 +1403,11 @@ def fetch_and_parse_emails_workflow(args):
         if not test_mode:
             print("📂 Attempting to load properties from master_listings.csv...")
             empty_df = pd.DataFrame(columns=['title', 'address', 'price', 'size', 'link'])
-            df_merged = merge_with_master_listings(empty_df, output_dir=output_dir, file_suffix=file_suffix)
+            df_merged = merge_with_master_listings(empty_df, output_dir=output_dir, file_suffix=file_suffix, property_type=property_type)
             
             # Check duplicates against processed properties
             if len(df_merged) > 0:
-                processed_finnkodes = load_processed_finnkodes_from_distances_csv(output_dir, file_suffix)
+                processed_finnkodes = load_processed_finnkodes_from_distances_csv(output_dir, file_suffix, property_type)
                 if processed_finnkodes:
                     df_merged = df_merged.copy()
                     df_merged['_finnkode'] = df_merged['link'].apply(extract_finnkode)

@@ -1,0 +1,108 @@
+# config.yaml - Property Finder Configuration
+# ============================================
+
+# Shared settings used by both rental and sales
+shared:
+  work_location:
+    lat: 59.899
+    lng: 10.627
+  
+  max_transit_time_work_minutes: 60
+
+  search_radius_meters: 2000  # 2 km in meters
+  
+  place_categories:
+    EVO:
+      keywords: ['EVO', 'Evo Fitness', 'EVO Fitness']
+      calculate_transit: false
+      column_prefix: 'EVO'
+    SATS:
+      keywords: ['SATS', 'SATS Fitness']
+      calculate_transit: false
+      column_prefix: 'SATS'
+    martial_arts:
+      keywords: ['martial arts gym', 'boxing gym', 'jiu jitsu', 'MMA', 'muay thai', 'bjj', 'Wrestling']
+      calculate_transit: true
+      column_prefix: 'martial_arts'
+
+# Rental properties configuration
+rental:
+  enabled: false  # Enabled for testing separate outputs
+  
+  email:
+    subject_prefix: "New Rental Matches"
+    subject_keywords:
+      - 'Nye annonser: Property Finder - Leie'
+      - 'Nye annonser: 1500 m, Hybel med flere'
+      - 'Nye annonser: 30 km, Asker med flere'
+      - 'Nye annonser: sandvika, 700 m'
+  
+  filters:
+    max_price_per_month: null  # No limit, or set a number like 20000
+    min_size_sqm: null  # No limit, or set a number like 50
+  
+  days_back: 90
+  reprocess_emails: false
+
+# Sales properties configuration
+sales:
+  enabled: true  # Enabled for testing
+  
+  email:
+    subject_prefix: "New Sales Matches"
+    subject_keywords:
+      - 'Nye annonser: Property Finder - Eie'  # Actual subject from sales emails
+  
+  filters:
+    max_purchase_price: null  # No limit, same as rental
+    min_size_sqm: null  # No limit, same as rental
+    allowed_areas: []  # No area restrictions, same as rental
+  
+  days_back: 90  # Fetch emails from last 90 days for testing
+  reprocess_emails: true  # Reprocess all emails for testing
+
+# Test mode settings
+test_mode:
+  enabled: false
+  limit: 20
+
+# API Safety Settings
+api_safety:
+  max_geocoding_calls_per_run: 10000
+  max_distance_matrix_calls_per_run: 50000
+  max_places_calls_per_run: 20000
+  warning_threshold_percent: 80  # Warn at 80% of limit
+  hard_stop_on_limit: false
+
+# Data formatter settings (for Excel export)
+data_formatter:
+  enabled: true
+  
+  filters:
+    - column: 'price'
+      op: '<='
+      value: 15500
+    - OR:
+        - column: 'walking_time_EVO_minutes'
+          op: '<='
+          value: 5
+        - column: 'walking_time_SATS_minutes'
+          op: '<='
+          value: 5
+    - column: 'walking_time_martial_arts_minutes'
+      op: '<='
+      value: 10
+  
+  sort_by:
+    - column: 'transit_time_work_minutes'
+      ascending: false
+    - column: 'price'
+      ascending: false
+  
+  excel_formatting:
+    freeze_header: true
+    bold_header: true
+    auto_filter: true
+    auto_column_width: true
+  
+  output_filename: 'property_listings_filtered.xlsx'

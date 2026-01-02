@@ -2,8 +2,13 @@ import pandas as pd
 import os
 import time
 import googlemaps
+import logging
+from datetime import datetime
 from dotenv import load_dotenv
 from tracking_summary import tracker
+from config import get_type_aware_filename, load_api_safety_config
+from Email_Fetcher import extract_finnkode
+from distance_calculator import load_too_far_properties
 
 # Get script directory for relative paths
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -104,35 +109,51 @@ def has_valid_coordinates(row):
         return False
 
 
-def load_existing_coordinates(output_dir='output', file_suffix=''):
+def load_existing_coordinates(output_dir='output', file_suffix='', property_type='rental'):
     """
     Load existing coordinates from the coordinates CSV file.
+    
+    Uses finnkode (unique property ID) as the key instead of link to ensure
+    properties are recognized even if link format changes between runs.
     
     Args:
         output_dir: Directory where CSV files are stored
         file_suffix: Suffix appended to filename (e.g., '_test')
+        property_type: 'rental' or 'sales' (default: 'rental' for backward compat)
     
     Returns:
-        dict: Dictionary mapping property links to their coordinate data
+        dict: Dictionary mapping finnkode (str) to their coordinate data (dict)
     """
-    # Check both test and production CSVs
-    coords_csv = os.path.join(output_dir, f'property_listings_with_coordinates{file_suffix}.csv')
-    prod_coords_csv = os.path.join('output', 'property_listings_with_coordinates.csv')
+    # Use type-aware filename in the correct output_dir
+    coords_filename = get_type_aware_filename('property_listings_with_coordinates', property_type, file_suffix)
+    coords_csv = os.path.join(output_dir, coords_filename)
+    
+    # Also check old filename format within the same output_dir for backward compatibility (rental only)
+    paths_to_check = [coords_csv]
+    if property_type == 'rental' and file_suffix == '':
+        # For rental properties, also check old filename format (without type prefix) in the same directory
+        old_coords_csv = os.path.join(output_dir, 'property_listings_with_coordinates.csv')
+        if old_coords_csv != coords_csv:
+            paths_to_check.append(old_coords_csv)
     
     existing_coords = {}
     
-    for csv_path in [coords_csv, prod_coords_csv]:
+    # Check all possible file locations
+    for csv_path in paths_to_check:
         if os.path.exists(csv_path):
             try:
                 df = pd.read_csv(csv_path)
                 for _, row in df.iterrows():
                     link = row.get('link')
                     if link and has_valid_coordinates(row):
-                        existing_coords[link] = {
-                            'latitude': row['latitude'],
-                            'longitude': row['longitude'],
-                            'geocode_status': row['geocode_status']
-                        }
+                        # Extract finnkode from link and use it as the key
+                        finnkode = extract_finnkode(link)
+                        if finnkode:
+                            existing_coords[finnkode] = {
+                                'latitude': row['latitude'],
+                                'longitude': row['longitude'],
+                                'geocode_status': row['geocode_status']
+                            }
             except Exception as e:
                 print(f"⚠️  Warning: Could not load existing coordinates from {csv_path}: {e}")
     
@@ -154,8 +175,8 @@ def geocode_properties(args, input_csv_path=None):
     4. Saves results with latitude/longitude to a new CSV
     
     Args:
-        args: Argument object with output_dir, file_suffix attributes
-        input_csv_path: Path to input CSV (defaults to property_listings_latest.csv in output_dir)
+        args: Argument object with output_dir, file_suffix, property_type attributes
+        input_csv_path: Path to input CSV (defaults to type-aware property_listings_latest.csv in output_dir)
     
     Returns:
         str: Path to output CSV file with coordinates
@@ -163,14 +184,22 @@ def geocode_properties(args, input_csv_path=None):
     # Get output directory and file suffix from args
     output_dir = getattr(args, 'output_dir', 'output')
     file_suffix = getattr(args, 'file_suffix', '')
+    property_type = getattr(args, 'property_type', 'rental')  # Get property_type from args
     
     # Ensure output_dir is an absolute path
     if not os.path.isabs(output_dir):
         output_dir = os.path.join(script_dir, output_dir)
     
-    # Determine input CSV path
+    # Determine input CSV path (type-aware, with backward compatibility)
     if input_csv_path is None:
-        input_csv_path = os.path.join(output_dir, f'property_listings_latest{file_suffix}.csv')
+        # Try type-aware filename first
+        input_filename = get_type_aware_filename('property_listings_latest', property_type, file_suffix)
+        input_csv_path = os.path.join(output_dir, input_filename)
+        # If not found, try old naming for backward compatibility
+        if not os.path.exists(input_csv_path) and property_type == 'rental':
+            old_input_csv_path = os.path.join(output_dir, f'property_listings_latest{file_suffix}.csv')
+            if os.path.exists(old_input_csv_path):
+                input_csv_path = old_input_csv_path
     
     # Initialize Google Maps client
     if not GOOGLE_API_KEY:
@@ -197,36 +226,92 @@ def geocode_properties(args, input_csv_path=None):
     # ================================================
     # LOAD EXISTING COORDINATES
     # ================================================
-    existing_coords = load_existing_coordinates(output_dir, file_suffix)
+    existing_coords = load_existing_coordinates(output_dir, file_suffix, property_type)
     if existing_coords:
         print(f"📍 Found {len(existing_coords)} properties with existing valid coordinates")
+    
+    # ================================================
+    # LOAD PROPERTIES THAT WERE PREVIOUSLY TOO FAR AWAY
+    # ================================================
+    # Get work location and max travel time from args (with defaults)
+    work_lat = getattr(args, 'work_lat', None)
+    work_lng = getattr(args, 'work_lng', None)
+    max_transit_time_work = getattr(args, 'max_transit_time_work', None)
+    
+    too_far_finnkodes = set()
+    if work_lat is not None and work_lng is not None and max_transit_time_work is not None:
+        too_far_finnkodes = load_too_far_properties(
+            output_dir, file_suffix, property_type,
+            work_lat, work_lng, max_transit_time_work
+        )
+        if too_far_finnkodes:
+            print(f"⏭️  Found {len(too_far_finnkodes)} properties that were previously too far away (will skip geocoding)")
+    
+    # Initialize API safety and logging
+    api_safety = load_api_safety_config()
+    geocoding_calls = 0
+    max_geocoding_calls = api_safety['max_geocoding_calls_per_run']
+    warning_threshold = int(max_geocoding_calls * api_safety['warning_threshold_percent'] / 100)
+    
+    # Setup logging
+    logger = logging.getLogger('geocoding')
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        formatter = logging.Formatter(
+            '%(asctime)s - [%(levelname)s] - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
     
     # Separate properties that need geocoding vs those that don't
     needs_geocoding = []
     already_geocoded = []
+    skipped_too_far = 0
     
     for idx, row in df.iterrows():
         link = row.get('link')
         
-        # Check if we have existing valid coordinates for this property
-        if link and link in existing_coords:
+        # Extract finnkode from link and use it to match existing coordinates
+        finnkode = None
+        if link:
+            finnkode = extract_finnkode(link)
+        
+        # Check if property was previously too far away (skip geocoding if so)
+        if finnkode and finnkode in too_far_finnkodes:
             already_geocoded.append(idx)
+            skipped_too_far += 1
+            logger.info(f"[{property_type.upper()}] [GEOCODING] Property {finnkode}: SKIPPED (previously too far away, no API call)")
+        # Check if we have existing valid coordinates for this property (match by finnkode)
+        elif finnkode and finnkode in existing_coords:
+            already_geocoded.append(idx)
+            logger.info(f"[{property_type.upper()}] [GEOCODING] Property {finnkode}: SKIPPED (already geocoded, no API call)")
         elif has_valid_coordinates(row):
             # Already has valid coordinates in the current data
             already_geocoded.append(idx)
+            if finnkode:
+                logger.info(f"[{property_type.upper()}] [GEOCODING] Property {finnkode}: SKIPPED (has valid coordinates, no API call)")
         else:
             needs_geocoding.append(idx)
+            if finnkode:
+                logger.info(f"[{property_type.upper()}] [GEOCODING] Property {finnkode}: NEEDS geocoding (will make API call)")
     
     print(f"✅ Already geocoded: {len(already_geocoded)} properties (will skip)")
+    if skipped_too_far > 0:
+        print(f"   (Including {skipped_too_far} properties that were previously too far away)")
     print(f"📍 Need geocoding: {len(needs_geocoding)} properties")
     
-    # Apply existing coordinates to the DataFrame
+    # Apply existing coordinates to the DataFrame (match by finnkode)
     for idx, row in df.iterrows():
         link = row.get('link')
-        if link and link in existing_coords:
-            df.at[idx, 'latitude'] = existing_coords[link]['latitude']
-            df.at[idx, 'longitude'] = existing_coords[link]['longitude']
-            df.at[idx, 'geocode_status'] = existing_coords[link]['geocode_status']
+        if link:
+            finnkode = extract_finnkode(link)
+            if finnkode and finnkode in existing_coords:
+                df.at[idx, 'latitude'] = existing_coords[finnkode]['latitude']
+                df.at[idx, 'longitude'] = existing_coords[finnkode]['longitude']
+                df.at[idx, 'geocode_status'] = existing_coords[finnkode]['geocode_status']
     
     # If no properties need geocoding, skip the API calls
     if not needs_geocoding:
@@ -271,15 +356,38 @@ def geocode_properties(args, input_csv_path=None):
         
         # Loop through addresses that need geocoding
         for i, (idx, address) in enumerate(addresses_to_geocode, 1):
+            # Check API safety limits before making call
+            if geocoding_calls >= max_geocoding_calls:
+                if api_safety['hard_stop_on_limit']:
+                    logger.error(f"[{property_type.upper()}] [GEOCODING] API LIMIT REACHED: {geocoding_calls}/{max_geocoding_calls} calls. STOPPING to prevent credit exhaustion.")
+                    print(f"\n⚠️  API LIMIT REACHED: {geocoding_calls}/{max_geocoding_calls} geocoding calls")
+                    print("   Stopping to prevent API credit exhaustion.")
+                    break
+                else:
+                    logger.warning(f"[{property_type.upper()}] [GEOCODING] API LIMIT REACHED but hard_stop_on_limit is False. Continuing...")
+            
+            # Check warning threshold
+            if geocoding_calls >= warning_threshold and geocoding_calls < max_geocoding_calls:
+                logger.warning(f"[{property_type.upper()}] [GEOCODING] Approaching API limit: {geocoding_calls}/{max_geocoding_calls} calls ({int(geocoding_calls*100/max_geocoding_calls)}%)")
+            
+            # Extract finnkode for logging
+            link = df.at[idx, 'link']
+            finnkode = extract_finnkode(link) if link else None
+            
             print(f"\n[{i}/{len(addresses_to_geocode)}] Geocoding: {address}")
+            if finnkode:
+                logger.info(f"[{property_type.upper()}] [GEOCODING] Property {finnkode}: Making API call for address '{address}'")
             
             result = geocode_address(address, gmaps_client)
+            geocoding_calls += 1  # Track API call
             
             if result:
                 lat, lng = result
                 df.at[idx, 'latitude'] = lat
                 df.at[idx, 'longitude'] = lng
                 df.at[idx, 'geocode_status'] = "Success"
+                if finnkode:
+                    logger.info(f"[{property_type.upper()}] [GEOCODING] Property {finnkode}: SUCCESS - Coordinates: {lat}, {lng}")
                 successful_count += 1
                 print(f"  ✅ Success: ({lat:.6f}, {lng:.6f})")
             else:
@@ -287,6 +395,8 @@ def geocode_properties(args, input_csv_path=None):
                 df.at[idx, 'longitude'] = None
                 df.at[idx, 'geocode_status'] = "Failed"
                 failed_count += 1
+                if finnkode:
+                    logger.warning(f"[{property_type.upper()}] [GEOCODING] Property {finnkode}: FAILED to geocode address '{address}'")
                 print(f"  ❌ Failed to geocode")
             
             # Add a small delay to be polite to the API
@@ -295,6 +405,10 @@ def geocode_properties(args, input_csv_path=None):
         # Track geocoding results
         tracker.stats['step4_geocoding']['geocoding_success'] = successful_count + len(already_geocoded)
         tracker.stats['step4_geocoding']['geocoding_failed'] = failed_count
+        
+        # Print API usage summary
+        print(f"\n📊 API Usage: {geocoding_calls}/{max_geocoding_calls} geocoding calls ({int(geocoding_calls*100/max_geocoding_calls)}%)")
+        logger.info(f"[{property_type.upper()}] [GEOCODING] API Usage Summary: {geocoding_calls}/{max_geocoding_calls} calls made")
         
         # Print summary
         print("\n" + "="*70)
@@ -322,8 +436,9 @@ def geocode_properties(args, input_csv_path=None):
     if len(df) > 10:
         print(f"... and {len(df) - 10} more rows")
     
-    # Save the results to a new CSV file (with suffix)
-    output_file = os.path.join(output_dir, f'property_listings_with_coordinates{file_suffix}.csv')
+    # Save the results to a new CSV file (type-aware, with suffix)
+    output_filename = get_type_aware_filename('property_listings_with_coordinates', property_type, file_suffix)
+    output_file = os.path.join(output_dir, output_filename)
     os.makedirs(output_dir, exist_ok=True)
     df.to_csv(output_file, index=False, encoding='utf-8')
     print(f"\n💾 Saved results to: {output_file}")
